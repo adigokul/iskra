@@ -98,3 +98,41 @@ igl.write_triangle_mesh(
 )
 
 print(f"Results saved to: {output_dir.resolve()}")
+
+# Show the three meshes side by side. The offsets are only for visualization;
+# the OBJ files above retain their original coordinates.
+try:
+    import polyscope as ps
+
+    target_np = verts.detach().cpu().numpy()
+    inflated_np = verts_var.detach().cpu().numpy()
+    faired_np = faired.detach().cpu().numpy()
+    faces_np = faces.detach().cpu().numpy()
+
+    mesh_width = target_np[:, 0].max() - target_np[:, 0].min()
+    spacing = 1.5 * mesh_width
+
+    ps.init()
+    ps.set_ground_plane_mode("shadow_only")
+    ps.register_surface_mesh(
+        "target",
+        target_np + [-spacing, 0.0, 0.0],
+        faces_np,
+        color=(0.2, 0.6, 1.0),
+    )
+    ps.register_surface_mesh(
+        "inflated (optimized v)",
+        inflated_np,
+        faces_np,
+        color=(1.0, 0.55, 0.15),
+    )
+    ps.register_surface_mesh(
+        "faired g(v)",
+        faired_np + [spacing, 0.0, 0.0],
+        faces_np,
+        color=(0.3, 0.8, 0.4),
+    )
+    print("Opening Polyscope: target | inflated | faired")
+    ps.show()
+except ImportError:
+    print("Polyscope is unavailable. Install it with: python -m pip install polyscope")
