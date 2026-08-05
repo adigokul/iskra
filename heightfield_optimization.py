@@ -9,7 +9,17 @@ import sys
 
 import torch
 
-from run_heat_method_core import heat_method_distance
+import iskra.sparse as sp
+import iskra.sparse_linalg as sparse_linalg
+from iskra.dec import laplacian
+from iskra.fem import grad
+from iskra.geometry import triangle_areas
+from iskra.sparse_linalg import linear_solve
+from iskra.topology import face_index
+
+
+# Use the installed cholespy backend with this Iskra revision.
+sparse_linalg._cholmod_available = False
 
 
 def make_heightfield(
@@ -63,7 +73,48 @@ def diagonal_distance_loss(distance: torch.Tensor, diagonals: list[torch.Tensor]
         losses.append((phi - phi.mean()).square().mean())
     return torch.stack(losses).sum()
 
+def heat_method_distance(
+    vertices: torch.Tensor,
+    faces: torch.Tensor,
+    source: int | list[int] | torch.Tensor,
+    t_factor: float = 1.0,
+) -> tuple[torch.Tensor, torch.Tensor, float]:
+    """Approximate distance to source vertices using the three-step heat method."""
+    n_vertices = vertices.shape[0]
+    source = torch.as_tensor(source, dtype=torch.long, device=vertices.device).reshape(-1)
 
+    # Cotangent stiffness matrix L and lumped mass matrix M.
+    lap, mass = laplacian(vertices, faces)
+
+    # The heat-method time scale t = t_factor * h^2.
+    triangles = face_index(vertices, faces)
+    edges = triangles - triangles[:, [1, 2, 0], :]
+    mean_edge_length = torch.linalg.vector_norm(edges, dim=-1).mean()
+    time = t_factor * mean_edge_length.square()
+
+    # Step 1: diffuse a discrete Dirac load from the source vertices.
+    delta = vertices.new_zeros(n_vertices)
+    delta[source] = 1.0
+    temperature = linear_solve(lap * time + mass, delta)[1]
+
+    # Step 2: keep only the direction of the negative heat gradient.
+    gradient = grad(vertices, faces, stack=True)
+    grad_temperature = sp.matmul(gradient, temperature).reshape(3, -1)
+    direction = -grad_temperature / torch.linalg.vector_norm(
+        grad_temperature, dim=0, keepdim=True
+    ).clamp_min(1e-12)
+
+    # Step 3: recover a scalar potential by solving the Poisson equation.
+    areas = triangle_areas(triangles)
+    divergence = sp.mul(
+        torch.cat(3 * [areas])[None, :], gradient.mT.coalesce()
+    )
+    rhs = sp.matmul(divergence, direction.flatten())
+    distance = linear_solve(lap + 1e-8 * mass, rhs)[1]
+    distance = distance - distance[source].mean()
+
+    return distance, temperature, time.item()
+    
 def main() -> None:
     # Imitating inflate.py
     nx = 20
@@ -147,7 +198,7 @@ def main() -> None:
         ps.set_ground_plane_mode("shadow_only")
         ps_mesh = ps.register_surface_mesh(
             "optimized heightfield",
-            optimized_vertices.cpu().numpy(),
+            optimized_verts.cpu().numpy(),
             faces.cpu().numpy(),
         )
         ps_mesh.add_scalar_quantity(
@@ -159,7 +210,7 @@ def main() -> None:
         )
         ps.register_point_cloud(
             "source",
-            optimized_vertices[source].cpu().numpy(),
+            optimized_verts[source].cpu().numpy(),
             enabled=True,
             radius=0.005,
         )
