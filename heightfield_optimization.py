@@ -121,7 +121,7 @@ def main() -> None:
     nz = 20
     width = 1.0
     depth = 1.0
-    iterations = 100
+    iterations = 1000
     learning_rate = 1e-2
     t_factor = 10.0
     device = "cpu"
@@ -131,20 +131,34 @@ def main() -> None:
         nx, nz, width=width, depth=depth, dtype=dtype, device=device
     )
     fixed_xz = verts[:, [0, 2]].clone()
-    diagonals = make_diagonals(nx, nz, device)
+
+    # Original all-diagonals experiment:
+    # diagonals = make_diagonals(nx, nz, device)
+
+    # Optimize only the middle (and longest, for a square grid) diagonal.
+    target_k = (nx + nz - 2) // 2
+    target_diagonal = torch.tensor(
+        [
+            i * nz + j
+            for i in range(nx)
+            for j in range(nz)
+            if i + j == target_k
+        ],
+        dtype=torch.long,
+        device=device,
+    )
 
     # target contours i+j=k
     source = torch.tensor([0], dtype=torch.long, device=device)
 
     torch.manual_seed(42)
-    grid_spacing = min(width / (nx - 1), depth / (nz - 1))
-    # Set a very small initial height to ensure a non-zero gradient, then enabling the optimizer to perform updates.
-    initial_heights = 1e-3 * grid_spacing * torch.randn(
+    # Small, non-constant heights break the symmetry of the perfectly flat mesh.
+    initial_heights = 1e-3 * torch.randn(
         nx * nz, dtype=dtype, device=device
     )
     initial_heights[source] = 0.0
     heights = torch.nn.Parameter(initial_heights)
-    optimizer = torch.optim.SGD([heights], lr=learning_rate)
+    optimizer = torch.optim.Adam([heights], lr=learning_rate)
 
     for i in range(iterations):
         optimizer.zero_grad()
@@ -155,7 +169,12 @@ def main() -> None:
             vertices, faces, source, t_factor=t_factor
         )
 
-        loss = diagonal_distance_loss(distance, diagonals)
+        # Original all-diagonals loss:
+        # loss = diagonal_distance_loss(distance, diagonals)
+
+        # Relaxed debugging loss: only one diagonal should have constant distance.
+        phi = distance[target_diagonal]
+        loss = (phi - phi.mean()).square().mean()
         loss.backward()
 
         if heights.grad is None or not torch.isfinite(heights.grad).all():
@@ -167,7 +186,14 @@ def main() -> None:
         with torch.no_grad():
             heights.sub_(heights[source].item())
 
-        print(f"iteration={i:03d}, loss={loss.item():.8e}")
+        if i % 50 == 0 or i == iterations - 1:
+            print(
+                f"iteration={i:04d}, "
+                f"loss={loss.item():.8e}, "
+                f"grad={heights.grad.norm().item():.8e}, "
+                f"y_range=[{heights.min().item():.4e}, "
+                f"{heights.max().item():.4e}]"
+            )
 
     optimized_verts = torch.stack(
         (fixed_xz[:, 0], heights.detach(), fixed_xz[:, 1]), dim=1
@@ -186,6 +212,8 @@ def main() -> None:
             "source": source,
             "nx": nx,
             "nz": nz,
+            "target_k": target_k,
+            "target_diagonal": target_diagonal,
         },
         output_dir / "optimized_heightfield.pt",
     )
@@ -196,9 +224,16 @@ def main() -> None:
 
         ps.init()
         ps.set_ground_plane_mode("shadow_only")
+
+        # Original visualization on the optimized 3D heightfield:
+        # display_verts = optimized_verts
+
+        # Debugging visualization: display the optimized distance field on the
+        # original flat parameter domain so contour shape is easier to inspect.
+        display_verts = verts
         ps_mesh = ps.register_surface_mesh(
-            "optimized heightfield",
-            optimized_verts.cpu().numpy(),
+            "geodesic contours on flat domain",
+            display_verts.cpu().numpy(),
             faces.cpu().numpy(),
         )
         ps_mesh.add_scalar_quantity(
@@ -210,7 +245,7 @@ def main() -> None:
         )
         ps.register_point_cloud(
             "source",
-            optimized_verts[source].cpu().numpy(),
+            display_verts[source].cpu().numpy(),
             enabled=True,
             radius=0.005,
         )
