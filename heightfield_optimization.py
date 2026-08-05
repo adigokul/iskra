@@ -132,10 +132,10 @@ def main() -> None:
     )
     fixed_xz = verts[:, [0, 2]].clone()
 
-    # Original all-diagonals experiment:
+    # All-diagonals experiment:
     # diagonals = make_diagonals(nx, nz, device)
 
-    # Optimize only the middle (and longest, for a square grid) diagonal.
+    # Relaxed single-diagonal experiment:
     target_k = (nx + nz - 2) // 2
     target_diagonal = torch.tensor(
         [
@@ -169,10 +169,10 @@ def main() -> None:
             vertices, faces, source, t_factor=t_factor
         )
 
-        # Original all-diagonals loss:
+        # All-diagonals loss:
         # loss = diagonal_distance_loss(distance, diagonals)
 
-        # Relaxed debugging loss: only one diagonal should have constant distance.
+        # Relaxed single-diagonal loss:
         phi = distance[target_diagonal]
         loss = (phi - phi.mean()).square().mean()
         loss.backward()
@@ -201,6 +201,32 @@ def main() -> None:
     final_distance, _, _ = heat_method_distance(
         optimized_verts, faces, source, t_factor=t_factor
     )
+
+    # All-diagonals diagnostics:
+    # diagonal_stds = torch.stack(
+    #     [final_distance[d].std(correction=0) for d in diagonals]
+    # )
+    # diagonal_ranges = torch.stack(
+    #     [final_distance[d].max() - final_distance[d].min() for d in diagonals]
+    # )
+    # print("All-diagonals diagnostics:")
+    # print(f"  diagonals={len(diagonals)}")
+    # print(f"  mean_std={diagonal_stds.mean().item():.8e}")
+    # print(f"  max_std={diagonal_stds.max().item():.8e}")
+    # print(f"  mean_range={diagonal_ranges.mean().item():.8e}")
+    # print(f"  max_range={diagonal_ranges.max().item():.8e}")
+
+    # Relaxed single-diagonal diagnostics:
+    target_phi = final_distance[target_diagonal]
+    target_range = target_phi.max() - target_phi.min()
+    print("Target diagonal diagnostics:")
+    print(f"  k={target_k}")
+    print(f"  vertices={target_diagonal.numel()}")
+    print(f"  mean={target_phi.mean().item():.8e}")
+    print(f"  min={target_phi.min().item():.8e}")
+    print(f"  max={target_phi.max().item():.8e}")
+    print(f"  std={target_phi.std(correction=0).item():.8e}")
+    print(f"  range={target_range.item():.8e}")
 
     output_dir = Path("results/heightfield_contours")
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -248,6 +274,25 @@ def main() -> None:
             display_verts[source].cpu().numpy(),
             enabled=True,
             radius=0.005,
+        )
+
+        # Relaxed single-diagonal debugging visual:
+        target_points = display_verts[target_diagonal].detach().cpu().numpy()
+        n_target = target_diagonal.numel()
+        target_edges = torch.stack(
+            (
+                torch.arange(n_target - 1),
+                torch.arange(1, n_target),
+            ),
+            dim=1,
+        ).numpy()
+        ps.register_curve_network(
+            f"target diagonal k={target_k}",
+            target_points,
+            target_edges,
+            color=(1.0, 0.0, 0.0),
+            radius=0.004,
+            enabled=True,
         )
         ps.show()
 
