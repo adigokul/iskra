@@ -151,11 +151,12 @@ def main() -> None:
     # target contours i+j=k
     source = torch.tensor([0], dtype=torch.long, device=device)
 
-    torch.manual_seed(42)
-    # Small, non-constant heights break the symmetry of the perfectly flat mesh.
-    initial_heights = 1e-3 * torch.randn(
-        nx * nz, dtype=dtype, device=device
-    )
+    # A small, smooth, non-constant bump breaks the symmetry of the perfectly
+    # flat mesh without introducing high-frequency random noise.
+    u = torch.linspace(0.0, torch.pi, nx, dtype=dtype, device=device)
+    v = torch.linspace(0.0, torch.pi, nz, dtype=dtype, device=device)
+    initial_height_grid = torch.sin(u)[:, None] * torch.sin(v)[None, :]
+    initial_heights = 1e-3 * initial_height_grid.reshape(-1)
     initial_heights[source] = 0.0
     heights = torch.nn.Parameter(initial_heights)
     optimizer = torch.optim.Adam([heights], lr=learning_rate)
