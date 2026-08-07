@@ -270,17 +270,17 @@ def optimize_heightfield(
         distance_min=final_target_phi.min().item(),
         distance_max=final_target_phi.max().item(),
         distance_std=final_target_phi.std(correction=0).item(),
-        distance_range=(
-            final_target_phi.max() - final_target_phi.min()
-        ).item(),
+        distance_range=(final_target_phi.max() - final_target_phi.min()).item(),
         # smoothness=height_smoothness_loss(
         #     heights.detach(), nx, nz
         # ).item(),
-        smoothness=normal_smoothness_loss(
-            optimized_vertices, faces, make_adjacent_face_pairs(faces)
-        ).item(),
+        smoothness=normal_smoothness_loss(optimized_vertices, faces, adjacent_face_pairs).item(),
     )
 
+
+# ---------------------------------------------------------------------------
+# Pareto analysis (distance vs smoothness)
+# ---------------------------------------------------------------------------
 
 def run_pareto_analysis(
     initial_heights: torch.Tensor,
@@ -364,7 +364,7 @@ def run_pareto_analysis(
             textcoords="offset points",
             fontsize=8,
         )
-    axis.set_xlabel("Height smoothness energy")
+    axis.set_xlabel("Normal smoothness energy")
     axis.set_ylabel("Target diagonal distance std")
     axis.set_title("Distance-smoothness Pareto analysis")
     axis.grid(True, alpha=0.3)
@@ -375,7 +375,6 @@ def run_pareto_analysis(
     print(f"Pareto data saved to: {csv_path.resolve()}")
     print(f"Pareto plot saved to: {figure_path.resolve()}")
     plt.show()
-
 
 def visualize_result(
     display_vertices: torch.Tensor,
@@ -425,6 +424,179 @@ def visualize_result(
         enabled=True,
     )
     ps.show()
+
+
+# ---------------------------------------------------------------------------
+# Comparison table experiments (fixed source or fixed target)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ExpConfig:
+    name: str
+    source: torch.Tensor
+    target: torch.Tensor
+    source_label: str
+    target_label: str
+
+
+def make_target_line(nx: int, nz: int, kind: str, value: int, device: str) -> torch.Tensor:
+    """Return vertex indices for a target line: diagonal, row, or column."""
+    indices: list[int] = []
+    if kind == "diag":
+        for i in range(nx):
+            for j in range(nz):
+                if i + j == value:
+                    indices.append(i * nz + j)
+    elif kind == "row":
+        i = value
+        for j in range(nz):
+            indices.append(i * nz + j)
+    elif kind == "col":
+        j = value
+        for i in range(nx):
+            indices.append(i * nz + j)
+    else:
+        raise ValueError(f"Unknown kind: {kind}")
+    if len(indices) < 2:
+        raise ValueError(
+            f"Target line '{kind}={value}' has fewer than 2 vertices"
+        )
+    return torch.tensor(indices, dtype=torch.long, device=device)
+
+def run_comparison_table(
+    initial_heights: torch.Tensor,
+    fixed_xz: torch.Tensor,
+    faces: torch.Tensor,
+    adjacent_face_pairs: torch.Tensor,
+    *,
+    nx: int,
+    nz: int,
+    iterations: int,
+    learning_rate: float,
+    t_factor: float,
+    smoothness_weight: float,   
+    configs: list[ExpConfig],
+    output_dir: Path,
+) -> None:
+    """Run one weight for all configs and save a CSV table."""
+    import csv
+
+    rows: list[dict[str, float | str]] = []
+
+    for cfg in configs:
+        print(f"\n=== {cfg.name}: {cfg.source_label} → {cfg.target_label} ===")
+        result = optimize_heightfield(
+            initial_heights,
+            fixed_xz,
+            faces,
+            cfg.source,
+            cfg.target,
+            adjacent_face_pairs,
+            nx=nx,
+            nz=nz,
+            iterations=iterations,
+            learning_rate=learning_rate,
+            t_factor=t_factor,
+            smoothness_weight=smoothness_weight,
+            print_every=None,
+        )
+        rows.append(
+            {
+                "experiment": cfg.name,
+                "source": cfg.source_label,
+                "target": cfg.target_label,
+                "weight": smoothness_weight,
+                "distance_mean": result.distance_mean,
+                "distance_std": result.distance_std,
+                "distance_range": result.distance_range,
+                "smoothness": result.smoothness,
+            }
+        )
+        print(
+            f"  std={result.distance_std:.4e}, "
+            f"range={result.distance_range:.4e}, "
+            f"smooth={result.smoothness:.4e}"
+        )
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = output_dir / "comparison_table.csv"
+    with csv_path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=rows[0].keys())
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"\nComparison table saved to: {csv_path.resolve()}")
+
+def run_compare_experiments(
+    initial_heights: torch.Tensor,
+    fixed_xz: torch.Tensor,
+    faces: torch.Tensor,
+    adjacent_face_pairs: torch.Tensor,
+    nx: int,
+    nz: int,
+    iterations: int,
+    learning_rate: float,
+    t_factor: float,
+    output_dir: Path,
+    device: str,
+) -> None:
+    """Entry point for --compare: fixed weight, vary source/target geometry."""
+    fixed_weight = 1e-4 
+
+    # ------------------------------------------------------------------
+    # Experiment A: fixed source, vary target
+    # ------------------------------------------------------------------
+    source_fixed = torch.tensor([0, nx * nz - 1], dtype=torch.long, device=device)
+
+    configs_a = [
+        ExpConfig("A1", source_fixed, make_target_line(nx, nz, "diag", (nx + nz - 2) // 2, device), "diag[0,399]", "diag_center"),
+        ExpConfig("A2", source_fixed, make_target_line(nx, nz, "diag", (nx + nz - 2) // 4, device), "diag[0,399]", "diag_near"),
+        ExpConfig("A3", source_fixed, make_target_line(nx, nz, "diag", 3 * (nx + nz - 2) // 4, device), "diag[0,399]", "diag_far"),
+        ExpConfig("A4", source_fixed, make_target_line(nx, nz, "row", nx // 2, device), "diag[0,399]", "row_center"),
+        ExpConfig("A5", source_fixed, make_target_line(nx, nz, "col", nz // 2, device), "diag[0,399]", "col_center"),
+    ]
+
+    run_comparison_table(
+        initial_heights,
+        fixed_xz,
+        faces,
+        adjacent_face_pairs,
+        nx=nx,
+        nz=nz,
+        iterations=iterations,
+        learning_rate=learning_rate,
+        t_factor=t_factor,
+        smoothness_weight=fixed_weight,
+        configs=configs_a,
+        output_dir=output_dir / "exp_A_fixed_source",
+    )
+
+    # ------------------------------------------------------------------
+    # Experiment B: fixed target, vary source
+    # ------------------------------------------------------------------
+    target_fixed = make_target_line(nx, nz, "diag", (nx + nz - 2) // 2 - 1, device)
+
+    configs_b = [
+        ExpConfig("B1", torch.tensor([0], dtype=torch.long, device=device), target_fixed, "corner_0", "diag_center"),
+        ExpConfig("B2", torch.tensor([nx * nz - 1], dtype=torch.long, device=device), target_fixed, "corner_399", "diag_center"),
+        ExpConfig("B3", torch.tensor([0, nx * nz - 1], dtype=torch.long, device=device), target_fixed, "diag_pair", "diag_center"),
+        ExpConfig("B4", torch.tensor([nz - 1, (nx - 1) * nz], dtype=torch.long, device=device), target_fixed, "anti_diag", "diag_center"),
+        ExpConfig("B5", torch.tensor([(nx // 2) * nz + (nz // 2)], dtype=torch.long, device=device), target_fixed, "center", "diag_center"),
+    ]
+
+    run_comparison_table(
+        initial_heights,
+        fixed_xz,
+        faces,
+        adjacent_face_pairs,
+        nx=nx,
+        nz=nz,
+        iterations=iterations,
+        learning_rate=learning_rate,
+        t_factor=t_factor,
+        smoothness_weight=fixed_weight,
+        configs=configs_b,
+        output_dir=output_dir / "exp_B_fixed_target",
+    )
 
 
 def main() -> None:
@@ -479,6 +651,8 @@ def main() -> None:
     initial_heights = 1e-3 * initial_height_grid.reshape(-1)
     initial_heights[source] = 0.0
 
+    adjacent_pairs = make_adjacent_face_pairs(faces)
+
     if "--pareto" in sys.argv:
         run_pareto_analysis(
             initial_heights,
@@ -495,14 +669,29 @@ def main() -> None:
         )
         return
 
-    adjacent_pairs = make_adjacent_face_pairs(faces)
+    if "--compare" in sys.argv:  
+        run_compare_experiments(
+            initial_heights,
+            fixed_xz,
+            faces,
+            adjacent_pairs,
+            nx=nx,
+            nz=nz,
+            iterations=100,  
+            learning_rate=learning_rate,
+            t_factor=t_factor,
+            output_dir=Path("results/heightfield_compare"),
+            device=device,
+        )
+        return
+    
     result = optimize_heightfield(
         initial_heights,
         fixed_xz,
         faces,
         source,
         target_diagonal,
-        adjacent_pairs,
+        adjacent_pairs, 
         nx=nx,
         nz=nz,
         iterations=iterations,
@@ -510,9 +699,9 @@ def main() -> None:
         t_factor=t_factor,
         smoothness_weight=smoothness_weight,
     )
+
     optimized_verts = result.vertices
     final_distance = result.distance
-
     # All-diagonals diagnostics:
     # diagonal_stds = torch.stack(
     #     [final_distance[d].std(correction=0) for d in diagonals]
@@ -593,4 +782,10 @@ python -c "import torch; import iskra.sparse; print('environment OK')"
 /Users/huyufan/iskra-heightfield-publish/.venv/bin/python \
   /Users/huyufan/iskra-heightfield-publish/heightfield_optimization.py \
   --pareto
+'''
+
+'''
+/Users/huyufan/iskra-heightfield-publish/.venv/bin/python \
+  /Users/huyufan/iskra-heightfield-publish/heightfield_optimization.py \
+  --compare
 '''
