@@ -623,7 +623,7 @@ def main() -> None:
 
     # Relaxed single-diagonal experiment:
     # target_k = (nx + nz - 2) // 2
-    target_k = 5
+    target_k = 10
     target_diagonal = torch.tensor(
         [
             i * nz + j
@@ -638,7 +638,7 @@ def main() -> None:
     # target contours i+j=k
     # source = torch.tensor([0], dtype=torch.long, device=device)
     source = torch.tensor(
-        [0, nx * nz - 1],
+        [0,(nz - 1), (nx - 1) * nz],
         dtype=torch.long,
         device=device,
     )
