@@ -72,6 +72,7 @@ def make_heightfield(
 
     return vertices, torch.tensor(faces, dtype=torch.long, device=device)
 
+'''
 def make_diagonals(nx: int, nz: int, device: str) -> list[torch.Tensor]:
     """Group vertex indices by i + j = k, skipping one-vertex diagonals."""
     diagonals: list[torch.Tensor] = []
@@ -89,13 +90,10 @@ def diagonal_distance_loss(distance: torch.Tensor, diagonals: list[torch.Tensor]
         phi = distance[diagonal]
         losses.append((phi - phi.mean()).square().mean())
     return torch.stack(losses).sum()
+'''
 
 
-def height_smoothness_loss(
-    heights: torch.Tensor,
-    nx: int,
-    nz: int,
-) -> torch.Tensor:
+def height_smoothness_loss(heights: torch.Tensor, nx: int, nz: int) -> torch.Tensor:
     """Sum squared height differences over all axis-aligned grid edges."""
     y = heights.reshape(nx, nz)
 
@@ -126,16 +124,10 @@ def make_adjacent_face_pairs(faces: torch.Tensor) -> torch.Tensor:
             else:
                 edge_to_face[edge] = current_face
 
-    return torch.tensor(
-        adjacent_pairs, dtype=torch.long, device=faces.device
-    )
+    return torch.tensor(adjacent_pairs, dtype=torch.long, device=faces.device)
 
 
-def normal_smoothness_loss(
-    vertices: torch.Tensor,
-    faces: torch.Tensor,
-    adjacent_face_pairs: torch.Tensor,
-) -> torch.Tensor:
+def normal_smoothness_loss(vertices: torch.Tensor, faces: torch.Tensor, adjacent_face_pairs: torch.Tensor) -> torch.Tensor:
     """Penalize unit-normal differences between adjacent triangles."""
     triangles = vertices[faces]
     edge_1 = triangles[:, 1] - triangles[:, 0]
@@ -199,6 +191,7 @@ def optimize_heightfield(
     faces: torch.Tensor,
     source: torch.Tensor,
     target_diagonal: torch.Tensor,
+    adjacent_face_pairs: torch.Tensor,
     *,
     nx: int,
     nz: int,
@@ -218,12 +211,8 @@ def optimize_heightfield(
         optimizer.zero_grad()
 
         # y column depends on the optimizer
-        vertices = torch.stack(
-            (fixed_xz[:, 0], heights, fixed_xz[:, 1]), dim=1
-        )
-        distance, _, _ = heat_method_distance(
-            vertices, faces, source, t_factor=t_factor
-        )
+        vertices = torch.stack((fixed_xz[:, 0], heights, fixed_xz[:, 1]), dim=1)
+        distance, _, _ = heat_method_distance(vertices, faces, source, t_factor=t_factor)
 
         # All-diagonals loss:
         # loss = diagonal_distance_loss(distance, diagonals)
@@ -234,7 +223,7 @@ def optimize_heightfield(
         target_phi = distance[target_diagonal]
         loss_distance = (target_phi - target_phi.mean()).square().mean()
         # loss_smoothness = height_smoothness_loss(heights, nx, nz)
-        loss_smoothness = normal_smoothness_loss(vertices, faces, make_adjacent_face_pairs(faces))
+        loss_smoothness = normal_smoothness_loss(vertices, faces, adjacent_face_pairs)
         loss = loss_distance + smoothness_weight * loss_smoothness
         loss.backward()
 
@@ -247,8 +236,8 @@ def optimize_heightfield(
         # Remove the irrelevant global y translation by anchoring the source
         # Global y translation does not change intrinsic distances, so source
         # y=0 removes an irrelevant degree of freedom.
-        with torch.no_grad():
-            heights.sub_(heights[source].mean().item())
+        # with torch.no_grad():
+        #     heights.sub_(heights[source].mean().item())
 
         should_print = print_every is not None and (
             iteration % print_every == 0 or iteration == iterations - 1
@@ -284,8 +273,11 @@ def optimize_heightfield(
         distance_range=(
             final_target_phi.max() - final_target_phi.min()
         ).item(),
-        smoothness=height_smoothness_loss(
-            heights.detach(), nx, nz
+        # smoothness=height_smoothness_loss(
+        #     heights.detach(), nx, nz
+        # ).item(),
+        smoothness=normal_smoothness_loss(
+            optimized_vertices, faces, make_adjacent_face_pairs(faces)
         ).item(),
     )
 
@@ -321,6 +313,7 @@ def run_pareto_analysis(
     ]
     rows: list[dict[str, float]] = []
 
+    adjacent_pairs = make_adjacent_face_pairs(faces)
     for weight in weights:
         print(f"Pareto run: smoothness_weight={weight:.1e}")
         result = optimize_heightfield(
@@ -329,6 +322,7 @@ def run_pareto_analysis(
             faces,
             source,
             target_diagonal,
+            adjacent_pairs,
             nx=nx,
             nz=nz,
             iterations=iterations,
@@ -456,7 +450,8 @@ def main() -> None:
     # diagonals = make_diagonals(nx, nz, device)
 
     # Relaxed single-diagonal experiment:
-    target_k = (nx + nz - 2) // 2
+    # target_k = (nx + nz - 2) // 2
+    target_k = 5
     target_diagonal = torch.tensor(
         [
             i * nz + j
@@ -500,12 +495,14 @@ def main() -> None:
         )
         return
 
+    adjacent_pairs = make_adjacent_face_pairs(faces)
     result = optimize_heightfield(
         initial_heights,
         fixed_xz,
         faces,
         source,
         target_diagonal,
+        adjacent_pairs,
         nx=nx,
         nz=nz,
         iterations=iterations,
