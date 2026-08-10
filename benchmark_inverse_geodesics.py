@@ -17,18 +17,16 @@ from pathlib import Path
 import torch
 
 import iskra.sparse as sp
-import iskra.sparse_linalg as sparse_linalg
+from heightfield_optimization import (
+    heat_method_distance,
+    make_adjacent_face_pairs,
+    make_heightfield,
+    normal_smoothness_loss,
+)
 from iskra.apps.inverse_geodesics import rdg_solve
 from iskra.dec import laplacian
-from iskra.fem import grad
-from iskra.geometry import triangle_areas
 from iskra.mesh import Mesh
-from iskra.sparse_linalg import linear_solve, min_quadratic_energy
-from iskra.topology import face_index
-
-
-# Match the backend choice in the supplied Heat Method program.
-sparse_linalg._cholmod_available = False
+from iskra.sparse_linalg import min_quadratic_energy
 
 
 @dataclass
@@ -75,68 +73,6 @@ def distance_errors(
     )
 
 
-def heat_method_distance(
-    vertices: torch.Tensor,
-    faces: torch.Tensor,
-    source: torch.Tensor,
-    t_factor: float,
-) -> torch.Tensor:
-    """The differentiable Heat Method from the supplied implementation."""
-    lap, mass = laplacian(vertices, faces)
-    triangles = face_index(vertices, faces)
-    edges = triangles - triangles[:, [1, 2, 0], :]
-    mean_edge_length = torch.linalg.vector_norm(edges, dim=-1).mean()
-    heat_time = t_factor * mean_edge_length.square()
-
-    delta = vertices.new_zeros(vertices.shape[0])
-    delta[source] = 1.0
-    temperature = linear_solve(lap * heat_time + mass, delta)[1]
-
-    gradient = grad(vertices, faces, stack=True)
-    grad_temperature = sp.matmul(gradient, temperature).reshape(3, -1)
-    direction = -grad_temperature / torch.linalg.vector_norm(
-        grad_temperature, dim=0, keepdim=True
-    ).clamp_min(1e-12)
-
-    areas = triangle_areas(triangles)
-    divergence = sp.mul(torch.cat(3 * [areas])[None, :], gradient.mT.coalesce())
-    rhs = sp.matmul(divergence, direction.flatten())
-    distance = linear_solve(lap + 1e-8 * mass, rhs)[1]
-    return distance - distance[source].mean()
-
-
-def make_adjacent_face_pairs(faces: torch.Tensor) -> torch.Tensor:
-    """Build the fixed face adjacency once, outside the timed loop."""
-    edge_to_face: dict[tuple[int, int], int] = {}
-    pairs: list[list[int]] = []
-    for face_index_value, face in enumerate(faces.detach().cpu().tolist()):
-        for a, b in ((face[0], face[1]), (face[1], face[2]), (face[2], face[0])):
-            edge = (min(a, b), max(a, b))
-            if edge in edge_to_face:
-                pairs.append([edge_to_face[edge], face_index_value])
-            else:
-                edge_to_face[edge] = face_index_value
-    return torch.tensor(pairs, dtype=torch.long, device=faces.device)
-
-
-def normal_smoothness_loss(
-    vertices: torch.Tensor,
-    faces: torch.Tensor,
-    adjacent: torch.Tensor,
-) -> torch.Tensor:
-    """Mean unit-normal jump over interior edges."""
-    triangles = vertices[faces]
-    normals = torch.linalg.cross(
-        triangles[:, 1] - triangles[:, 0],
-        triangles[:, 2] - triangles[:, 0],
-        dim=1,
-    )
-    normals = normals / torch.linalg.vector_norm(
-        normals, dim=1, keepdim=True
-    ).clamp_min(1e-12)
-    return (normals[adjacent[:, 0]] - normals[adjacent[:, 1]]).square().sum(1).mean()
-
-
 def run_heat_method(
     initial_vertices: torch.Tensor,
     faces: torch.Tensor,
@@ -164,7 +100,9 @@ def run_heat_method(
     for iteration in range(max_iterations + 1):
         optimizer.zero_grad(set_to_none=True)
         vertices = terrain()
-        distance = heat_method_distance(vertices, faces, source_indices, t_factor)
+        distance, _, _ = heat_method_distance(
+            vertices, faces, source_indices, t_factor=t_factor
+        )
         l2_error, rmse, max_error = distance_errors(
             distance, targets, desired_distance
         )
@@ -294,33 +232,6 @@ def parse_indices(text: str, device: torch.device) -> torch.Tensor:
     return torch.tensor(values, dtype=torch.long, device=device)
 
 
-def make_heightfield(
-    nx: int,
-    nz: int,
-    *,
-    dtype: torch.dtype,
-    device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Reproduce the generated grid and smooth initial bump from the attachment."""
-    x = torch.linspace(0.0, 1.0, nx, dtype=dtype, device=device)
-    z = torch.linspace(0.0, 1.0, nz, dtype=dtype, device=device)
-    xx, zz = torch.meshgrid(x, z, indexing="ij")
-    u = torch.linspace(0.0, torch.pi, nx, dtype=dtype, device=device)
-    v = torch.linspace(0.0, torch.pi, nz, dtype=dtype, device=device)
-    height = 1e-3 * (torch.sin(u)[:, None] * torch.sin(v)[None, :]).reshape(-1)
-    vertices = torch.stack((xx.reshape(-1), height, zz.reshape(-1)), dim=1)
-
-    faces: list[list[int]] = []
-    for i in range(nx - 1):
-        for j in range(nz - 1):
-            v00 = i * nz + j
-            v01 = v00 + 1
-            v10 = (i + 1) * nz + j
-            v11 = v10 + 1
-            faces.extend(([v00, v01, v10], [v10, v01, v11]))
-    return vertices, torch.tensor(faces, dtype=torch.long, device=device)
-
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Time Iskra inverse geodesics to a common L2 threshold."
@@ -370,8 +281,14 @@ def main() -> None:
     dtype = torch.float64
     if args.mesh is None:
         vertices, faces = make_heightfield(
-            args.nx, args.nz, dtype=dtype, device=device
+            args.nx, args.nz, dtype=dtype, device=str(device)
         )
+        # Reproduce the smooth symmetry-breaking bump used by the experiment.
+        u = torch.linspace(0.0, torch.pi, args.nx, dtype=dtype, device=device)
+        v = torch.linspace(0.0, torch.pi, args.nz, dtype=dtype, device=device)
+        vertices[:, 1] = 1e-3 * (
+            torch.sin(u)[:, None] * torch.sin(v)[None, :]
+        ).reshape(-1)
         if args.targets is None:
             targets = torch.tensor(
                 [
