@@ -48,10 +48,12 @@ class HeightfieldFromVertices(torch.nn.Module):
     def __init__(self, vertices: torch.Tensor) -> None:
         super().__init__()
         self.register_buffer("xz", vertices[:, (0, 2)].clone())
-        self.y = torch.nn.Parameter(vertices[:, 1].clone())
+        # Iskra's inverse-geodesics app represents height as a [V, 1]
+        # column vector; keep that convention for its quadratic forms.
+        self.y = torch.nn.Parameter(vertices[:, 1:2].clone())
 
     def forward(self) -> torch.Tensor:
-        return torch.stack((self.xz[:, 0], self.y, self.xz[:, 1]), dim=1)
+        return torch.cat((self.xz[:, :1], self.y, self.xz[:, 1:]), dim=1)
 
 
 def synchronize(device: torch.device) -> None:
@@ -138,7 +140,7 @@ def normal_smoothness_loss(
 def run_heat_method(
     initial_vertices: torch.Tensor,
     faces: torch.Tensor,
-    source: int,
+    source: torch.Tensor,
     targets: torch.Tensor,
     desired_distance: float,
     *,
@@ -152,7 +154,7 @@ def run_heat_method(
     device = initial_vertices.device
     terrain = HeightfieldFromVertices(initial_vertices)
     optimizer = torch.optim.Adam(terrain.parameters(), lr=learning_rate)
-    source_indices = torch.tensor([source], dtype=torch.long, device=device)
+    source_indices = source.to(device=device, dtype=torch.long).reshape(-1)
     adjacent = make_adjacent_face_pairs(faces)
     converged = False
     iterations = 0
@@ -199,7 +201,7 @@ def run_heat_method(
 def run_iskra(
     initial_vertices: torch.Tensor,
     faces: torch.Tensor,
-    source: int,
+    source: torch.Tensor,
     targets: torch.Tensor,
     desired_distance: float,
     *,
@@ -214,7 +216,7 @@ def run_iskra(
     dtype = initial_vertices.dtype
     terrain = HeightfieldFromVertices(initial_vertices).to(device=device, dtype=dtype)
     optimizer = torch.optim.SGD(terrain.parameters(), lr=learning_rate)
-    bc_idx = torch.tensor([source], device=device, dtype=torch.long)
+    bc_idx = source.to(device=device, dtype=torch.long).reshape(-1)
     solver = None
     converged = False
     iterations = 0
@@ -292,15 +294,52 @@ def parse_indices(text: str, device: torch.device) -> torch.Tensor:
     return torch.tensor(values, dtype=torch.long, device=device)
 
 
+def make_heightfield(
+    nx: int,
+    nz: int,
+    *,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reproduce the generated grid and smooth initial bump from the attachment."""
+    x = torch.linspace(0.0, 1.0, nx, dtype=dtype, device=device)
+    z = torch.linspace(0.0, 1.0, nz, dtype=dtype, device=device)
+    xx, zz = torch.meshgrid(x, z, indexing="ij")
+    u = torch.linspace(0.0, torch.pi, nx, dtype=dtype, device=device)
+    v = torch.linspace(0.0, torch.pi, nz, dtype=dtype, device=device)
+    height = 1e-3 * (torch.sin(u)[:, None] * torch.sin(v)[None, :]).reshape(-1)
+    vertices = torch.stack((xx.reshape(-1), height, zz.reshape(-1)), dim=1)
+
+    faces: list[list[int]] = []
+    for i in range(nx - 1):
+        for j in range(nz - 1):
+            v00 = i * nz + j
+            v01 = v00 + 1
+            v10 = (i + 1) * nz + j
+            v11 = v10 + 1
+            faces.extend(([v00, v01, v10], [v10, v01, v11]))
+    return vertices, torch.tensor(faces, dtype=torch.long, device=device)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Time Iskra inverse geodesics to a common L2 threshold."
     )
-    parser.add_argument("mesh", type=Path)
-    parser.add_argument("--source", type=int, required=True)
     parser.add_argument(
-        "--targets", required=True, help="Comma-separated target vertex indices"
+        "mesh",
+        nargs="?",
+        type=Path,
+        help="Optional mesh path; omit it to generate the attachment's grid",
     )
+    parser.add_argument(
+        "--source", default="0", help="One index or comma-separated source indices"
+    )
+    parser.add_argument(
+        "--targets", help="Comma-separated targets; defaults to a grid diagonal"
+    )
+    parser.add_argument("--nx", type=int, default=20)
+    parser.add_argument("--nz", type=int, default=20)
+    parser.add_argument("--target-diagonal", type=int, default=10)
     parser.add_argument("--desired-distance", type=float, required=True)
     parser.add_argument("--l2-tolerance", type=float, default=1e-3)
     parser.add_argument("--max-iterations", type=int, default=200)
@@ -329,15 +368,37 @@ def main() -> None:
     args = build_parser().parse_args()
     device = torch.device(args.device)
     dtype = torch.float64
-    mesh, _ = Mesh.from_path(args.mesh, dtype=dtype, device=str(device))
-    vertices = mesh.geom.vertices.to(device=device, dtype=dtype)
-    faces = mesh.topo.faces.to(device=device)
-    targets = parse_indices(args.targets, device)
+    if args.mesh is None:
+        vertices, faces = make_heightfield(
+            args.nx, args.nz, dtype=dtype, device=device
+        )
+        if args.targets is None:
+            targets = torch.tensor(
+                [
+                    i * args.nz + j
+                    for i in range(args.nx)
+                    for j in range(args.nz)
+                    if i + j == args.target_diagonal
+                ],
+                dtype=torch.long,
+                device=device,
+            )
+        else:
+            targets = parse_indices(args.targets, device)
+    else:
+        mesh, _ = Mesh.from_path(args.mesh, dtype=dtype, device=str(device))
+        vertices = mesh.geom.vertices.to(device=device, dtype=dtype)
+        faces = mesh.topo.faces.to(device=device)
+        if args.targets is None:
+            raise SystemExit("--targets is required when a mesh file is supplied")
+        targets = parse_indices(args.targets, device)
+    source = parse_indices(args.source, device)
+    vertices[source, 1] = 0.0
 
     common = dict(
         initial_vertices=vertices,
         faces=faces,
-        source=args.source,
+        source=source,
         targets=targets,
         desired_distance=args.desired_distance,
         l2_tolerance=args.l2_tolerance,
@@ -374,8 +435,8 @@ def main() -> None:
         by_method.setdefault(result.method, []).append(result)
     report = {
         "configuration": {
-            "mesh": str(args.mesh.resolve()),
-            "source": args.source,
+            "mesh": str(args.mesh.resolve()) if args.mesh else "generated-grid",
+            "source": source.detach().cpu().tolist(),
             "targets": targets.detach().cpu().tolist(),
             "desired_distance": args.desired_distance,
             "l2_tolerance": args.l2_tolerance,
