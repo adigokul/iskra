@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 
 import iskra.sparse_linalg as sparse_linalg
+from fourier_analysis import analyze_height_spectrum
 from heightfield_optimization import (
     make_adjacent_face_pairs as adjacent_face_pairs,
     make_heightfield,
@@ -137,6 +138,18 @@ def main():
     print("evaluate the SAME weights at 128x128 (no retraining):")
     xz, F, V, phi, src, diag = sample(mlp, 128, k=32)
     render(V, F, phi, src, diag, "results/geodesics/neural_terrain.png")
+
+    print("analyze the trained MLP with Fourier analysis:")
+    analyze_height_spectrum(
+        mlp,
+        n=128,
+        cutoff=0.25,
+        out="results/geodesics/fourier_analysis.png",
+        show=True,
+    )
+
+    print("evaluate the SAME weights at 128x128:")
+    xz, F, V, phi, src, diag = sample(mlp, 128, k=33)
 
 
 if __name__ == "__main__":
