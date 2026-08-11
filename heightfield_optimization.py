@@ -608,7 +608,8 @@ def main() -> None:
     iterations = 1000
     learning_rate = 1e-2
     t_factor = 10.0
-    smoothness_weight = 1e-4
+    # smoothness_weight = 1e-4
+    smoothness_weight = 0
     pareto_iterations = 200
     device = "cpu"
     dtype = torch.float64
@@ -623,7 +624,7 @@ def main() -> None:
 
     # Relaxed single-diagonal experiment:
     # target_k = (nx + nz - 2) // 2
-    target_k = 10
+    target_k = 14
     target_diagonal = torch.tensor(
         [
             i * nz + j
@@ -636,12 +637,12 @@ def main() -> None:
     )
 
     # target contours i+j=k
-    # source = torch.tensor([0], dtype=torch.long, device=device)
-    source = torch.tensor(
-        [0,(nz - 1), (nx - 1) * nz],
-        dtype=torch.long,
-        device=device,
-    )
+    source = torch.tensor([0], dtype=torch.long, device=device)
+    # source = torch.tensor(
+    #     [0,(nz - 1), (nx - 1) * nz],
+    #     dtype=torch.long,
+    #     device=device,
+    # )
 
     # A small, smooth, non-constant bump breaks the symmetry of the perfectly
     # flat mesh without introducing high-frequency random noise.
