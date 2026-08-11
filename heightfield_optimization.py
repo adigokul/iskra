@@ -775,7 +775,7 @@ python -c "import torch; import iskra.sparse; print('environment OK')"
 
 '''
 /Users/huyufan/iskra-heightfield-publish/.venv/bin/python \
-  /Users/huyufan/iskra-heightfield-publish/heightfield_optimization.py \
+  /Users/huyufan/Documents/GitHub/iskra/heightfield_optimization.py \
   --visualize
 '''
 
