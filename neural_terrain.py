@@ -7,9 +7,9 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
+import time
 
 import iskra.sparse_linalg as sparse_linalg
-
 from heightfield_optimization import (
     make_adjacent_face_pairs as adjacent_face_pairs,
     make_heightfield,
@@ -52,35 +52,103 @@ class MLP(nn.Module):
         self.scale = scale
 
     def forward(self, xz):
-        return self.net(2.0 * xz - 1.0).squeeze(-1) * self.scale
+        raw = self.net(2.0 * xz - 1.0).squeeze(-1)
+        return torch.tanh(raw) * self.scale
 
 
 def heights_to_verts(xz, h):
     return torch.stack([xz[:, 0], h, xz[:, 1]], dim=1)
 
 
-def train(mlp, n, k, iters, lr=1e-2, weight=8e-3):
+def train(mlp, n, k, iters, lr=1e-2, weight=8e-3, contour_tolerance=1e-3, desired_distance=0.5):
     # train the MLP on an n x n mesh so the i+j=k diagonal becomes one distance contour
     xz, F = make_grid(n)
     pairs = adjacent_face_pairs(F)
     src = torch.tensor([0, n * n - 1])  # two opposite corners
     diag = diagonal(n, k)
     opt = torch.optim.Adam(mlp.parameters(), lr=lr)
-    for _ in range(iters):
+
+    converged = False   
+    start_time = time.perf_counter()
+
+    for iteration in range(iters + 1):
         opt.zero_grad()
         V = heights_to_verts(xz, mlp(xz))
         phi = heat_method_distance(V, F, src, t_factor=10.0)
         d = phi[diag]
-        loss = (d - d.mean()).square().mean() + weight * normal_smoothness_loss(
-            V, F, pairs
-        )
+        # l2_error = torch.linalg.vector_norm(error)
+
+        # if iteration % 25 == 0:
+        #     print(f"  {n}x{n}: {iteration} iters, l2_error={l2_error:.2e}", flush=True)
+
+        # if l2_error <= l2_tolerance:
+        #     converged = True
+        #     break
+
+        contour_loss = (d - d.mean()).square().mean()
+        contour_std = d.std(correction=0)
+
+        if iteration % 25 == 0:
+            print(
+                f"  {n}x{n}: "
+                f"iteration={iteration}, "
+                f"contour_loss={contour_loss.item():.6e}, "
+                f"contour_std={contour_std.item():.6e}",
+                flush=True,
+            )
+
+        if contour_std.item() <= contour_tolerance:
+            converged = True
+            break
+
+        if iteration == iters: 
+            break
+        
+        loss_smoothness = normal_smoothness_loss(V, F, pairs)
+        loss = contour_loss + weight * loss_smoothness
         loss.backward()
+
+        for name, param in mlp.named_parameters():
+            if param.grad is not None:
+                print(f"  {name}: {param.grad.norm().item():.2e}")
+
+            if not torch.isfinite(param.grad).all():
+                raise RuntimeError(f"Non-finite gradient detected in {name} at iteration {iteration}")
         opt.step()
+
+    elapsed = time.perf_counter() - start_time
+
     with torch.no_grad():
         V = heights_to_verts(xz, mlp(xz))
-        std = heat_method_distance(V, F, src, 10.0)[diag].std(correction=0).item()
-    print(f"  {n}x{n}: {iters} iters, diagonal std={std:.2e}", flush=True)
+        phi = heat_method_distance(V, F, src, t_factor=10.0)
+        d = phi[diag]
+
+        contour_loss = (d - d.mean()).square().mean().item()
+        contour_std = d.std(correction=0).item()
+
+        # Desired-distance accuracy is reported only as an extra metric.
+        target_error = d - desired_distance
+        target_l2 = torch.linalg.vector_norm(target_error).item()
+        target_rmse = target_error.square().mean().sqrt().item()
+        target_max_error = target_error.abs().max().item()
+        mean_distance = d.mean().item()
+    
+    print(
+        f"  {n}x{n}: "
+        f"converged={converged}, "
+        f"iterations={iteration}, "
+        f"time={elapsed:.4f}s, "
+        f"contour_loss={contour_loss:.6e}, "
+        f"contour_std={contour_std:.6e}, "
+        f"mean_distance={mean_distance:.6e}, "
+        f"target_l2={target_l2:.6e}, "
+        f"target_rmse={target_rmse:.6e}, "
+        f"target_max_error={target_max_error:.6e}",
+        flush=True,
+    )
+
     return xz, F, src, diag
+
 
 
 def sample(mlp, n, k):
@@ -89,6 +157,11 @@ def sample(mlp, n, k):
     src = torch.tensor([0, n * n - 1])
     with torch.no_grad():
         V = heights_to_verts(xz, mlp(xz))
+        print(
+            f"height min={V[:, 1].min().item():.6f}, "
+            f"max={V[:, 1].max().item():.6f}, "
+            f"range={(V[:, 1].max() - V[:, 1].min()).item():.6f}"
+        )
         phi = heat_method_distance(V, F, src, 10.0)
     return xz, F, V, phi, src, diagonal(n, k)
 
@@ -125,33 +198,32 @@ def render(V, F, phi, src, diag, out):
     )
     ps.register_curve_network("diag", pts, e, radius=0.004).set_color((1, 0, 0))
     ps.look_at((1.9, 1.5, 1.9), (0.5, 0.0, 0.5))
-    ps.screenshot(out)
-    print(f"  wrote {out}", flush=True)
+    # ps.screenshot(out)
+    # print(f"  wrote {out}", flush=True)
+    ps.show()
 
 
 def main():
     torch.manual_seed(0)
-    mlp = MLP()
+    mlp = MLP(scale=0.1)
 
     print("train the MLP on a cheap 32x32 mesh:")
-    train(mlp, 32, k=8, iters=400)
-
-    print("evaluate the SAME weights at 128x128 (no retraining):")
-    xz, F, V, phi, src, diag = sample(mlp, 128, k=32)
-    render(V, F, phi, src, diag, "results/geodesics/neural_terrain.png")
+    train(mlp, 32, k=8, iters=400, contour_tolerance=1e-3, desired_distance=0.5)
 
     print("analyze the trained MLP with Fourier analysis:")
-    analyze_height_spectrum(
-        mlp,
-        n=128,
-        cutoff=0.25,
-        out="results/geodesics/fourier_analysis.png",
-        show=True,
-    )
+    analyze_height_spectrum(mlp, n=128, cutoff=0.25, out="results/geodesics/fourier_analysis.png", show=True)
 
-    print("evaluate the SAME weights at 128x128:")
-    xz, F, V, phi, src, diag = sample(mlp, 128, k=33)
+    print("evaluate the SAME weights at 128x128 (no retraining):")
+    xz, F, V, phi, src, diag = sample(mlp, 128, k=31)
+    render(V, F, phi, src, diag, "results/geodesics/neural_terrain.png")
 
 
 if __name__ == "__main__":
     main()
+
+
+'''
+cd /Users/huyufan/iskra-heightfield-publish
+source .venv/bin/activate
+python neural_terrain.py
+'''
