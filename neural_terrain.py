@@ -9,13 +9,14 @@ import torch
 import torch.nn as nn
 
 import iskra.sparse_linalg as sparse_linalg
-from fourier_analysis import analyze_height_spectrum
+
 from heightfield_optimization import (
     make_adjacent_face_pairs as adjacent_face_pairs,
     make_heightfield,
     normal_smoothness_loss,
 )
 from iskra.geometry.geodesics import heat_method_distance
+from fourier_analysis import analyze_height_spectrum
 
 sparse_linalg._cholmod_available = False
 
