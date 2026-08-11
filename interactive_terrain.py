@@ -1,6 +1,6 @@
 """Terrain optimization demo (Polyscope).
 
-Bend a 20x20 heightfield so the geodesic distance from a source matches a target:
+Bend a grid heightfield so the geodesic distance from a source matches a target:
 either the built-in diagonal made equidistant, or a set of points I click and give
 one constant distance. Run with `python interactive_terrain.py`.
 """
@@ -12,7 +12,7 @@ from iskra.geometry.geodesics import heat_method_distance
 
 sparse_linalg._cholmod_available = False   # use cholespy, not scikit-sparse
 
-NX = NZ = 20
+NX = NZ = 40
 MESH_NAME = "terrain"
 
 
@@ -81,23 +81,27 @@ class App:
         self.optimizer_kind = 0    # 0 Adam, 1 SGD
         self.lr = 1e-2
         self.smooth_kind = 0       # 0 normal, 1 height
-        self.smooth_weight = 1e-4
-        self.pin_boundary = True
+        self.smooth_weight = 1e-3
+        self.pin_boundary = False
         self.t_factor = 10.0
-        self.target_k = (NX + NZ - 2) // 2
+        self.target_k = 5
         self.running = False
         self.iter = 0
         self.loss = float("nan")
         self.std = float("nan")
+        self.l2 = float("nan")         # L2 norm of (achieved - target) distances
+        self.tol = 1e-3                # stop when the L2 error drops below this
+        self.auto_stop = True
 
         self.manual_targets = []       # vertices I clicked
         self.const_distance = 0.5      # distance I want them all at
         self.use_manual = False
         self.click_mode = 0            # 0 target, 1 source
+        self.auto_source = True        # source follows the target centroid until you place one
         self._last_pick = None
 
         self.xz, self.F = make_grid(NX, NZ)
-        self.source = torch.tensor([0])
+        self.source = torch.tensor([0, NX * NZ - 1])   # two opposite corners (Diana's setup)
         self.pairs = adjacent_face_pairs(self.F)
         self.edges = edge_list(self.F)
         self.boundary = boundary_vertices(self.F)
@@ -133,6 +137,14 @@ class App:
         p = np.asarray(position, dtype=float)
         return int(((self.vertices3d().numpy() - p) ** 2).sum(axis=1).argmin())
 
+    def sync_point_source(self):
+        # put the source at the centroid of the picked targets so the shape stays
+        # local to them (a far source just warps near itself, not the targets)
+        if self.manual_targets and self.auto_source:
+            ij = np.array([(t // NZ, t % NZ) for t in self.manual_targets], dtype=float).mean(0)
+            i, j = int(round(ij[0])), int(round(ij[1]))
+            self.source = torch.tensor([i * NZ + j])
+
     def step(self):
         self.opt.zero_grad()
         V = self.vertices3d(detached=False)
@@ -141,11 +153,13 @@ class App:
         if self.use_manual and self.manual_targets:
             d = phi[torch.tensor(self.manual_targets)]
             data_loss = (d - self.const_distance).square().mean()
-            self.std = (d.detach() - self.const_distance).abs().mean().item()
+            resid = d.detach() - self.const_distance      # achieved - desired distance
         else:
             d = phi[self.diag]
             data_loss = (d - d.mean()).square().mean()
-            self.std = d.detach().std(correction=0).item()
+            resid = d.detach() - d.detach().mean()
+        self.std = resid.abs().mean().item()
+        self.l2 = float(torch.linalg.vector_norm(resid))  # ||achieved - target||_2
 
         if self.smooth_kind == 0:
             smooth = normal_smoothness_loss(V, self.F, self.pairs)
@@ -160,7 +174,7 @@ class App:
         self.opt.step()
         if not pin:
             with torch.no_grad():
-                self.heights.sub_(self.heights[self.source].item())   # anchor the source height
+                self.heights.sub_(self.heights[self.source].mean().item())   # anchor the source height
         self.iter += 1
         self.loss = loss.item()
         return phi.detach()
@@ -173,15 +187,19 @@ class App:
     def draw_markers(self, ps):
         V = self.vertices3d().numpy()
         ps.register_point_cloud("source", V[self.source.numpy()], radius=0.01, enabled=True)
-        pts = V[self.diag.numpy()]
-        e = np.stack([np.arange(len(pts) - 1), np.arange(1, len(pts))], axis=1)
-        ps.register_curve_network("target", pts, e, radius=0.004).set_color((1.0, 0.0, 0.0))
-        if self.manual_targets:
-            pcm = ps.register_point_cloud("picked targets", V[np.array(self.manual_targets)],
-                                          radius=0.014, enabled=True)
-            pcm.set_color((0.1, 0.1, 1.0))
+        # only draw the target that is actually the objective
+        if self.use_manual:
+            ps.remove_curve_network("target", error_if_absent=False)   # no red diagonal in point mode
+            if self.manual_targets:
+                ps.register_point_cloud("picked targets", V[np.array(self.manual_targets)],
+                                        radius=0.014, enabled=True).set_color((0.1, 0.1, 1.0))
+            else:
+                ps.remove_point_cloud("picked targets", error_if_absent=False)
         else:
             ps.remove_point_cloud("picked targets", error_if_absent=False)
+            pts = V[self.diag.numpy()]
+            e = np.stack([np.arange(len(pts) - 1), np.arange(1, len(pts))], axis=1)
+            ps.register_curve_network("target", pts, e, radius=0.004).set_color((1.0, 0.0, 0.0))
 
     def update_scalar(self, ps, phi):
         q = ps.get_surface_mesh(MESH_NAME).add_scalar_quantity(
@@ -203,45 +221,78 @@ def make_callback(app):
     import polyscope.imgui as psim
 
     def callback():
-        sel = ps.get_selection()
-        if sel.is_hit and sel.structure_name == MESH_NAME:
+        try:
+            sel = ps.get_selection()
+        except Exception:
+            sel = None                      # a pick on a re-registered marker can throw
+        if sel is not None and sel.is_hit and sel.structure_name == MESH_NAME:
             key = (sel.structure_name, int(sel.local_index))
             if key != app._last_pick:
                 app._last_pick = key
                 v = app.nearest_vertex(sel.position)
                 if app.click_mode == 0:
-                    if not app.manual_targets:
-                        app.const_distance = round(float(app.current_distance()[v]), 4)
                     if v not in app.manual_targets:
                         app.manual_targets.append(v)
                     app.use_manual = True
+                    app.sync_point_source()          # source follows the targets
+                    app.reset()
+                    app.const_distance = round(1.3 * float(
+                        app.current_distance()[torch.tensor(app.manual_targets)].mean()), 3)
                 else:
                     app.source = torch.tensor([v])
+                    app.auto_source = False          # you placed it -> stop auto-following
                     app.reset()
                 app.refresh_geometry(ps)
                 app.update_scalar(ps, app.current_distance().numpy())
 
-        metric = "target err" if (app.use_manual and app.manual_targets) else "contour std"
         psim.Text(f"grid {NX}x{NZ}   verts {app.xz.shape[0]}")
-        psim.Text(f"iter {app.iter}   loss {app.loss:.3e}   {metric} {app.std:.3e}")
+        psim.Text(f"iter {app.iter}   loss {app.loss:.3e}   L2 error {app.l2:.3e}")
 
         _, app.click_mode = psim.Combo("click places", app.click_mode, ["target point", "source"])
-        psim.Text(f"source: vertex {int(app.source.item())}")
+        psim.Text(f"source: {app.source.tolist()}")
 
-        _, app.use_manual = psim.Checkbox("match picked targets (else auto contour)", app.use_manual)
+        ch, app.use_manual = psim.Checkbox("match picked targets (else auto contour)", app.use_manual)
+        if ch:
+            if app.use_manual:                       # point mode: local source + more smoothing
+                app.pin_boundary = True
+                app.smooth_weight = 8e-3
+                app.auto_source = True
+                app.sync_point_source()
+            else:                                    # diagonal mode: Diana's 2-corner setup
+                app.source = torch.tensor([0, NX * NZ - 1])
+                app.pin_boundary = False
+                app.smooth_weight = 1e-3
+            app.reset()
+            app.refresh_geometry(ps)
+            app.update_scalar(ps, app.current_distance().numpy())
+        if not app.use_manual:                           # move which diagonal is the target
+            chk, app.target_k = psim.SliderInt("target diagonal k", app.target_k, 1, 2 * NX - 3)
+            if chk:
+                app.diag = target_diagonal(NX, NZ, app.target_k)
+                app.draw_markers(ps)
         _, app.const_distance = psim.InputFloat("constant distance (all targets)", app.const_distance)
+        ch2, app.auto_source = psim.Checkbox("auto source (follow targets)", app.auto_source)
+        if ch2 and app.auto_source:
+            app.sync_point_source(); app.reset()
+            app.refresh_geometry(ps); app.update_scalar(ps, app.current_distance().numpy())
         if not app.manual_targets:
             psim.Text("  (set mode to 'target point' and click the surface)")
         else:
             psim.Text(f"  {len(app.manual_targets)} target(s) -> distance {app.const_distance:.3f}")
             if psim.Button("remove last"):
                 app.manual_targets.pop()
-                app.refresh_geometry(ps)
+                app.sync_point_source(); app.reset()
+                app.refresh_geometry(ps); app.update_scalar(ps, app.current_distance().numpy())
             psim.SameLine()
             if psim.Button("clear targets"):
                 app.manual_targets = []
                 app.use_manual = False
-                app.refresh_geometry(ps)
+                app.auto_source = True
+                app.source = torch.tensor([0, NX * NZ - 1])
+                app.pin_boundary = False
+                app.smooth_weight = 1e-3
+                app.reset()
+                app.refresh_geometry(ps); app.update_scalar(ps, app.current_distance().numpy())
 
         psim.Separator()
         if psim.Button("Run" if not app.running else "Pause"):
@@ -269,11 +320,15 @@ def make_callback(app):
         _, app.smooth_weight = psim.SliderFloat("smoothness weight", app.smooth_weight, 1e-5, 1e-1,
                                                 format="%.5f", flags=logf)
         _, app.pin_boundary = psim.Checkbox(f"pin boundary ({len(app.boundary)} verts)", app.pin_boundary)
+        _, app.auto_stop = psim.Checkbox("stop when L2 error < tol", app.auto_stop)
+        _, app.tol = psim.SliderFloat("tol", app.tol, 1e-5, 1e-1, format="%.5f", flags=logf)
 
         if app.running or step_once:
             phi = app.step()
             app.refresh_geometry(ps)
             app.update_scalar(ps, phi.numpy())
+            if app.auto_stop and app.l2 < app.tol:      # termination on the L2 error norm
+                app.running = False
 
     return callback
 

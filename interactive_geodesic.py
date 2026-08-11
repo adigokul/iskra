@@ -144,8 +144,11 @@ def make_callback(app):
     import polyscope.imgui as psim
 
     def callback():
-        sel = ps.get_selection()
-        if sel.is_hit and sel.structure_name == MESH_NAME:
+        try:
+            sel = ps.get_selection()
+        except Exception:
+            sel = None                      # a pick on a re-registered marker can throw
+        if sel is not None and sel.is_hit and sel.structure_name == MESH_NAME:
             key = (sel.structure_name, int(sel.local_index))
             if key != app._last_pick:
                 app._last_pick = key
