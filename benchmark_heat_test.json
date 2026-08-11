@@ -1,0 +1,42 @@
+{
+  "configuration": {
+    "mesh": "generated-grid",
+    "source": [
+      0
+    ],
+    "targets": [
+      10,
+      29,
+      48,
+      67,
+      86,
+      105,
+      124,
+      143,
+      162,
+      181,
+      200
+    ],
+    "desired_distance": 0.5,
+    "l2_tolerance": 0.01,
+    "max_iterations": 2,
+    "device": "cpu",
+    "dtype": "torch.float64"
+  },
+  "methods": {
+    "heat_method": {
+      "median_elapsed_seconds": 0.14660225005354732,
+      "runs": [
+        {
+          "method": "heat_method",
+          "converged": false,
+          "elapsed_seconds": 0.14660225005354732,
+          "iterations": 2,
+          "final_l2": 0.25067095787999083,
+          "final_rmse": 0.07558013755699199,
+          "final_max_error": 0.11546777376076789
+        }
+      ]
+    }
+  }
+}

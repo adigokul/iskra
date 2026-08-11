@@ -222,8 +222,8 @@ def optimize_heightfield(
         # Relaxed single-diagonal loss:
         target_phi = distance[target_diagonal]
         loss_distance = (target_phi - target_phi.mean()).square().mean()
-        # loss_smoothness = height_smoothness_loss(heights, nx, nz)
-        loss_smoothness = normal_smoothness_loss(vertices, faces, adjacent_face_pairs)
+        loss_smoothness = height_smoothness_loss(heights, nx, nz)
+        # loss_smoothness = normal_smoothness_loss(vertices, faces, adjacent_face_pairs)
         loss = loss_distance + smoothness_weight * loss_smoothness
         loss.backward()
 
@@ -623,7 +623,7 @@ def main() -> None:
 
     # Relaxed single-diagonal experiment:
     # target_k = (nx + nz - 2) // 2
-    target_k = 10
+    target_k = 14
     target_diagonal = torch.tensor(
         [
             i * nz + j
@@ -636,12 +636,13 @@ def main() -> None:
     )
 
     # target contours i+j=k
-    # source = torch.tensor([0], dtype=torch.long, device=device)
-    source = torch.tensor(
-        [0,(nz - 1), (nx - 1) * nz],
-        dtype=torch.long,
-        device=device,
-    )
+    source = torch.tensor([0], dtype=torch.long, device=device)
+
+    # source = torch.tensor(
+    #     [0,(nz - 1), (nx - 1) * nz],
+    #     dtype=torch.long,
+    #     device=device,
+    # )
 
     # A small, smooth, non-constant bump breaks the symmetry of the perfectly
     # flat mesh without introducing high-frequency random noise.
