@@ -222,8 +222,8 @@ def optimize_heightfield(
         # Relaxed single-diagonal loss:
         target_phi = distance[target_diagonal]
         loss_distance = (target_phi - target_phi.mean()).square().mean()
-        # loss_smoothness = height_smoothness_loss(heights, nx, nz)
-        loss_smoothness = normal_smoothness_loss(vertices, faces, adjacent_face_pairs)
+        loss_smoothness = height_smoothness_loss(heights, nx, nz)
+        # loss_smoothness = normal_smoothness_loss(vertices, faces, adjacent_face_pairs)
         loss = loss_distance + smoothness_weight * loss_smoothness
         loss.backward()
 
@@ -608,8 +608,7 @@ def main() -> None:
     iterations = 1000
     learning_rate = 1e-2
     t_factor = 10.0
-    # smoothness_weight = 1e-4
-    smoothness_weight = 0
+    smoothness_weight = 1e-4
     pareto_iterations = 200
     device = "cpu"
     dtype = torch.float64
@@ -638,6 +637,7 @@ def main() -> None:
 
     # target contours i+j=k
     source = torch.tensor([0], dtype=torch.long, device=device)
+
     # source = torch.tensor(
     #     [0,(nz - 1), (nx - 1) * nz],
     #     dtype=torch.long,
