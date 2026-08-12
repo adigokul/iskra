@@ -222,8 +222,8 @@ def optimize_heightfield(
         # Relaxed single-diagonal loss:
         target_phi = distance[target_diagonal]
         loss_distance = (target_phi - target_phi.mean()).square().mean()
-        loss_smoothness = height_smoothness_loss(heights, nx, nz)
-        # loss_smoothness = normal_smoothness_loss(vertices, faces, adjacent_face_pairs)
+        # loss_smoothness = height_smoothness_loss(heights, nx, nz)
+        loss_smoothness = normal_smoothness_loss(vertices, faces, adjacent_face_pairs)
         loss = loss_distance + smoothness_weight * loss_smoothness
         loss.backward()
 
@@ -311,6 +311,7 @@ def run_pareto_analysis(
         3e-3,
         1e-2,
     ]
+    
     rows: list[dict[str, float]] = []
 
     adjacent_pairs = make_adjacent_face_pairs(faces)
@@ -354,8 +355,19 @@ def run_pareto_analysis(
     smoothness_values = [row["smoothness"] for row in rows]
     distance_stds = [row["distance_std"] for row in rows]
 
+    # figure, axis = plt.subplots(figsize=(7, 5))
+    # axis.plot(smoothness_values, distance_stds, marker="o")
+
     figure, axis = plt.subplots(figsize=(7, 5))
-    axis.plot(smoothness_values, distance_stds, marker="o")
+
+    axis.scatter(
+        smoothness_values,
+        distance_stds,
+        s=60,
+    )
+
+    axis.set_xscale("log")
+    axis.set_yscale("log")
     for row in rows:
         axis.annotate(
             f"lambda={row['weight']:.0e}",
@@ -775,7 +787,7 @@ python -c "import torch; import iskra.sparse; print('environment OK')"
 
 '''
 /Users/huyufan/iskra-heightfield-publish/.venv/bin/python \
-  /Users/huyufan/iskra-heightfield-publish/heightfield_optimization.py \
+  /Users/huyufan/Documents/GitHub/iskra/heightfield_optimization.py \
   --visualize
 '''
 
