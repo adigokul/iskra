@@ -357,69 +357,6 @@ def run_target_analysis():
 
     return results
 
-
-    activations = ["tanh", "relu", "softplus", "silu"]
-    results = []
-
-    for activation in activations:
-        print(f"\nRunning activation={activation}", flush=True)
-        torch.manual_seed(0)
-        mlp = MLP(scale=0.2, activation=activation)
-        result = train(
-            mlp,
-            n=32,
-            k=8,
-            iters=400,
-            lr=1e-2,
-            weight=1e-4,
-            target_tolerance=1e-3,
-            desired_distance=0.5,
-        )
-        results.append(result)
-
-    output_dir = Path("results/geodesics/activation_analysis")
-    output_dir.mkdir(parents=True, exist_ok=True)
-    csv_path = output_dir / "activation_analysis.csv"
-
-    fieldnames = [
-        "activation",
-        "scale",
-        "converged",
-        "iterations",
-        "target_mse",
-        "target_rmse",
-        "normal_smoothness",
-        "height_range",
-        "runtime",
-    ]
-
-    with csv_path.open("w", newline="") as csv_file:
-        writer = csv.DictWriter(
-            csv_file,
-            fieldnames=fieldnames,
-        )
-        writer.writeheader()
-        writer.writerows(results)
-
-    print("\nActivation analysis summary:")
-    for result in results:
-        print(
-            f"activation={result['activation']}, "
-            f"converged={result['converged']}, "
-            f"iterations={result['iterations']}, "
-            f"mse={result['target_mse']:.6e}, "
-            f"rmse={result['target_rmse']:.6e}, "
-            f"smoothness={result['normal_smoothness']:.6e}, "
-            f"{result['normal_smoothness']:.6e}, "
-            f"height_range="
-            f"{result['height_range']:.6f}, "
-            f"time={result['runtime']:.2f}s"
-        )
-    print(f"\nResults saved to: {csv_path.resolve()}")
-
-    return results
-
-
 def run_activation_analysis():
     activations = [
         "tanh",
@@ -427,31 +364,37 @@ def run_activation_analysis():
         "softplus",
         "silu",
     ]
+    seeds = [0, 1, 2, 3, 4]
     results = []
-    for activation in activations:
-        print(f"\nRunning activation={activation}", flush=True)
-        torch.manual_seed(0)
-        mlp = MLP(scale=0.2, activation=activation)
 
-        result = train(
-            mlp,
-            n=32,
-            k=8,
-            iters=400,
-            lr=1e-2,
-            weight=1e-4,
-            target_tolerance=1e-3,
-            desired_distance=0.5,
-        )
-        result["activation"] = activation
-        results.append(result)
+    for activation in activations:
+        for seed in seeds:
+            print(f"\nRunning activation={activation}, " f"seed={seed}", flush=True)
+            torch.manual_seed(seed)
+            mlp = MLP(scale=0.2, activation=activation)
+            result = train(
+                mlp,
+                n=32,
+                k=8,
+                iters=400,
+                lr=1e-2,
+                weight=1e-4,
+                target_tolerance=1e-3,
+                desired_distance=0.5,
+            )
+
+            result["activation"] = activation
+            result["seed"] = seed
+            results.append(result)
 
     output_dir = Path("results/geodesics/activation_analysis")
     output_dir.mkdir(parents=True, exist_ok=True)
-    csv_path = output_dir / "activation_analysis.csv"
 
+    # Save every individual run.
+    csv_path = output_dir / "activation_analysis.csv"
     fieldnames = [
         "activation",
+        "seed",
         "scale",
         "converged",
         "iterations",
@@ -470,23 +413,71 @@ def run_activation_analysis():
         writer.writeheader()
         writer.writerows(results)
 
-    print("\nActivation analysis summary:")
-    for result in results:
-        print(
-            f"activation={result['activation']}, "
-            f"converged={result['converged']}, "
-            f"iterations={result['iterations']}, "
-            f"mse={result['target_mse']:.6e}, "
-            f"rmse={result['target_rmse']:.6e}, "
-            f"smoothness="
-            f"{result['normal_smoothness']:.6e}, "
-            f"height_range="
-            f"{result['height_range']:.6f}, "
-            f"time={result['runtime']:.2f}s"
-        )
-    print(f"\nResults saved to: {csv_path.resolve()}")
+    # Calculate median results for each activation.
+    summary_results = []
+    for activation in activations:
+        activation_results = [
+            result
+            for result in results
+            if result["activation"] == activation
+        ]
 
-    return results
+        def median(key):
+            values = [
+                result[key]
+                for result in activation_results
+            ]
+            return float(np.median(values))
+
+        convergence_rate = sum(
+            result["converged"]
+            for result in activation_results
+        ) / len(activation_results)
+
+        summary_results.append({
+            "activation": activation,
+            "convergence_rate": convergence_rate,
+            "median_iterations": median("iterations"),
+            "median_rmse": median("target_rmse"),
+            "median_smoothness": median(
+                "normal_smoothness"
+            ),
+            "median_runtime": median("runtime"),
+        })
+
+    summary_csv_path = (output_dir / "activation_summary.csv")
+
+    with summary_csv_path.open(
+        "w",
+        newline="",
+    ) as csv_file:
+        writer = csv.DictWriter(
+            csv_file,
+            fieldnames=summary_results[0].keys(),
+        )
+        writer.writeheader()
+        writer.writerows(summary_results)
+    print("\nMulti-seed activation summary:")
+
+    for result in summary_results:
+        print(
+            f"{result['activation']}: "
+            f"converged="
+            f"{result['convergence_rate']:.0%}, "
+            f"iterations="
+            f"{result['median_iterations']:.1f}, "
+            f"rmse="
+            f"{result['median_rmse']:.6e}, "
+            f"smoothness="
+            f"{result['median_smoothness']:.6e}, "
+            f"time="
+            f"{result['median_runtime']:.2f}s"
+        )
+
+    print(f"\nRaw results: {csv_path.resolve()}")
+    print(f"Summary: {summary_csv_path.resolve()}")
+
+    return results, summary_results
 
 def main():
     run_activation_analysis()
