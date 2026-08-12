@@ -1,8 +1,6 @@
 """
-Optimize a heightfield so Heat Method distance is constant on grid diagonals.
-
-The grid lies initially in the x-z plane.  Its x and z coordinates and triangle
-connectivity stay fixed; only the y coordinate of each vertex is optimized.
+Optimize a heightfield so the Heat Method distances on a target
+vertex set match a fixed desired distance.
 """
 
 from dataclasses import dataclass
@@ -14,12 +12,12 @@ import torch
 
 import iskra.sparse as sp
 import iskra.sparse_linalg as sparse_linalg
+from iskra.sparse_linalg import linear_solve, min_quadratic_energy
 from iskra.dec import laplacian
 from iskra.fem import grad
 from iskra.geometry import triangle_areas
 from iskra.sparse_linalg import linear_solve
 from iskra.topology import face_index
-
 
 # Use the installed cholespy backend with this Iskra revision.
 sparse_linalg._cholmod_available = False
@@ -37,6 +35,8 @@ class OptimizationResult:
     distance_std: float
     distance_range: float
     smoothness: float
+    distance_rmse: float
+    distance_max_error: float
 
 
 def make_heightfield(
@@ -126,7 +126,6 @@ def make_adjacent_face_pairs(faces: torch.Tensor) -> torch.Tensor:
 
     return torch.tensor(adjacent_pairs, dtype=torch.long, device=faces.device)
 
-
 def normal_smoothness_loss(vertices: torch.Tensor, faces: torch.Tensor, adjacent_face_pairs: torch.Tensor) -> torch.Tensor:
     """Penalize unit-normal differences between adjacent triangles."""
     triangles = vertices[faces]
@@ -142,48 +141,33 @@ def normal_smoothness_loss(vertices: torch.Tensor, faces: torch.Tensor, adjacent
     normal_2 = normals[adjacent_face_pairs[:, 1]]
     return (normal_1 - normal_2).square().sum(dim=1).mean()
 
-def heat_method_distance(
-    vertices: torch.Tensor,
-    faces: torch.Tensor,
-    source: int | list[int] | torch.Tensor,
-    t_factor: float = 1.0,
-) -> tuple[torch.Tensor, torch.Tensor, float]:
-    """Approximate distance to source vertices using the three-step heat method."""
-    n_vertices = vertices.shape[0]
+def heat_method_distance(vertices, faces, source, t_factor=1.0):
+    # geodesic distance from the source(s) to every vertex.
+    # t_factor scales the diffusion time (t = t_factor * mean_edge_len^2),
+    # bunny needs ~10, clean grids ~1
+    n = vertices.shape[0]
     source = torch.as_tensor(source, dtype=torch.long, device=vertices.device).reshape(-1)
 
-    # Cotangent stiffness matrix L and lumped mass matrix M.
     lap, mass = laplacian(vertices, faces)
+    tri = face_index(vertices, faces)
+    h = torch.linalg.vector_norm(tri - tri[:, [1, 2, 0], :], dim=-1).mean()
+    time = t_factor * h.square()
 
-    # The heat-method time scale t = t_factor * h^2.
-    triangles = face_index(vertices, faces)
-    edges = triangles - triangles[:, [1, 2, 0], :]
-    mean_edge_length = torch.linalg.vector_norm(edges, dim=-1).mean()
-    time = t_factor * mean_edge_length.square()
-
-    # Step 1: diffuse a discrete Dirac load from the source vertices.
-    delta = vertices.new_zeros(n_vertices)
+    # diffuse heat from the source
+    delta = vertices.new_zeros(n)
     delta[source] = 1.0
-    temperature = linear_solve(lap * time + mass, delta)[1]
+    u = linear_solve(lap * time + mass, delta)[1]
 
-    # Step 2: keep only the direction of the negative heat gradient.
-    gradient = grad(vertices, faces, stack=True)
-    grad_temperature = sp.matmul(gradient, temperature).reshape(3, -1)
-    direction = -grad_temperature / torch.linalg.vector_norm(
-        grad_temperature, dim=0, keepdim=True
-    ).clamp_min(1e-12)
+    # normalized gradient, pointing away from the source
+    G = grad(vertices, faces, stack=True)
+    g = sp.matmul(G, u).reshape(3, -1)
+    X = -g / torch.linalg.vector_norm(g, dim=0, keepdim=True).clamp_min(1e-12)
 
-    # Step 3: recover a scalar potential by solving the Poisson equation.
-    areas = triangle_areas(triangles)
-    divergence = sp.mul(
-        torch.cat(3 * [areas])[None, :], gradient.mT.coalesce()
-    )
-    rhs = sp.matmul(divergence, direction.flatten())
-    distance = linear_solve(lap + 1e-8 * mass, rhs)[1]
-    distance = distance - distance[source].mean()
-
-    return distance, temperature, time.item()
-
+    # solve L phi = div(X) with phi fixed to 0 at the source
+    areas = triangle_areas(tri)
+    div = sp.mul(torch.cat(3 * [areas])[None, :], G.mT.coalesce())
+    rhs = sp.matmul(div, X.flatten())
+    return min_quadratic_energy(lap, rhs, source, rhs.new_zeros(source.numel()))[1]
 
 def optimize_heightfield(
     initial_heights: torch.Tensor,
@@ -198,6 +182,7 @@ def optimize_heightfield(
     iterations: int,
     learning_rate: float,
     t_factor: float,
+    desired_distance: float,
     smoothness_weight: float,
     print_every: int | None = 50,
 ) -> OptimizationResult:
@@ -212,18 +197,18 @@ def optimize_heightfield(
 
         # y column depends on the optimizer
         vertices = torch.stack((fixed_xz[:, 0], heights, fixed_xz[:, 1]), dim=1)
-        distance, _, _ = heat_method_distance(vertices, faces, source, t_factor=t_factor)
+        distance = heat_method_distance(vertices, faces, source, t_factor=t_factor)
 
         # All-diagonals loss:
         # loss = diagonal_distance_loss(distance, diagonals)
         # Equivalent name used by this reorganized function:
         # loss_distance = diagonal_distance_loss(distance, diagonals)
 
-        # Relaxed single-diagonal loss:
         target_phi = distance[target_diagonal]
-        loss_distance = (target_phi - target_phi.mean()).square().mean()
-        # loss_smoothness = height_smoothness_loss(heights, nx, nz)
+        loss_distance = (target_phi - desired_distance).square().mean()
         loss_smoothness = normal_smoothness_loss(vertices, faces, adjacent_face_pairs)
+        # loss_height = height_smoothness_loss(heights, nx, nz)
+        # loss = loss_distance + smoothness_weight * loss_height
         loss = loss_distance + smoothness_weight * loss_smoothness
         loss.backward()
 
@@ -258,11 +243,10 @@ def optimize_heightfield(
     optimized_vertices = torch.stack(
         (fixed_xz[:, 0], heights.detach(), fixed_xz[:, 1]), dim=1
     )
-    final_distance, _, _ = heat_method_distance(
-        optimized_vertices, faces, source, t_factor=t_factor
-    )
+    final_distance = heat_method_distance(optimized_vertices, faces, source, t_factor=t_factor)
     final_target_phi = final_distance[target_diagonal]
 
+    target_error = final_target_phi - desired_distance
     return OptimizationResult(
         vertices=optimized_vertices,
         distance=final_distance.detach(),
@@ -270,11 +254,16 @@ def optimize_heightfield(
         distance_min=final_target_phi.min().item(),
         distance_max=final_target_phi.max().item(),
         distance_std=final_target_phi.std(correction=0).item(),
-        distance_range=(final_target_phi.max() - final_target_phi.min()).item(),
-        # smoothness=height_smoothness_loss(
-        #     heights.detach(), nx, nz
-        # ).item(),
-        smoothness=normal_smoothness_loss(optimized_vertices, faces, adjacent_face_pairs).item(),
+        distance_range=(
+            final_target_phi.max() - final_target_phi.min()
+        ).item(),
+        distance_rmse=target_error.square().mean().sqrt().item(),
+        distance_max_error=target_error.abs().max().item(),
+        smoothness=normal_smoothness_loss(
+            optimized_vertices,
+            faces,
+            adjacent_face_pairs,
+        ).item(),
     )
 
 
@@ -294,6 +283,7 @@ def run_pareto_analysis(
     iterations: int,
     learning_rate: float,
     t_factor: float,
+    desired_distance: float,
     output_dir: Path,
 ) -> None:
     """Sweep smoothness weights and plot the distance-smoothness trade-off."""
@@ -318,22 +308,24 @@ def run_pareto_analysis(
     for weight in weights:
         print(f"Pareto run: smoothness_weight={weight:.1e}")
         result = optimize_heightfield(
-            initial_heights,
-            fixed_xz,
-            faces,
-            source,
-            target_diagonal,
-            adjacent_pairs,
-            nx=nx,
-            nz=nz,
-            iterations=iterations,
-            learning_rate=learning_rate,
-            t_factor=t_factor,
-            smoothness_weight=weight,
-            print_every=None,
+        initial_heights,    
+        fixed_xz,
+        faces,
+        source,
+        target_diagonal,
+        adjacent_pairs,
+        nx=nx,
+        nz=nz,
+        iterations=iterations,
+        learning_rate=learning_rate,
+        t_factor=t_factor,
+        desired_distance=desired_distance,
+        smoothness_weight=weight,
         )
         row = {
             "weight": weight,
+            "distance_rmse": result.distance_rmse,
+            "distance_max_error": result.distance_max_error,
             "distance_std": result.distance_std,
             "distance_range": result.distance_range,
             "smoothness": result.smoothness,
@@ -353,32 +345,27 @@ def run_pareto_analysis(
         writer.writerows(rows)
 
     smoothness_values = [row["smoothness"] for row in rows]
-    distance_stds = [row["distance_std"] for row in rows]
-
-    # figure, axis = plt.subplots(figsize=(7, 5))
-    # axis.plot(smoothness_values, distance_stds, marker="o")
-
+    distance_errors = [row["distance_rmse"] for row in rows]
     figure, axis = plt.subplots(figsize=(7, 5))
-
     axis.scatter(
         smoothness_values,
-        distance_stds,
+        distance_errors,
         s=60,
     )
-
     axis.set_xscale("log")
     axis.set_yscale("log")
     for row in rows:
         axis.annotate(
             f"lambda={row['weight']:.0e}",
-            (row["smoothness"], row["distance_std"]),
+            (row["smoothness"], row["distance_rmse"]),
             xytext=(5, 5),
             textcoords="offset points",
             fontsize=8,
         )
+
     axis.set_xlabel("Normal smoothness energy")
-    axis.set_ylabel("Target diagonal distance std")
-    axis.set_title("Distance-smoothness Pareto analysis")
+    axis.set_ylabel("Target distance RMSE")
+    axis.set_title("Distance–smoothness Pareto analysis")
     axis.grid(True, alpha=0.3)
     figure.tight_layout()
 
@@ -386,6 +373,12 @@ def run_pareto_analysis(
     figure.savefig(figure_path, dpi=200)
     print(f"Pareto data saved to: {csv_path.resolve()}")
     print(f"Pareto plot saved to: {figure_path.resolve()}")
+    print(
+        f"  rmse={row['distance_rmse']:.8e}, "
+        f"max_error={row['distance_max_error']:.8e}, "
+        f"std={row['distance_std']:.8e}, "
+        f"smoothness={row['smoothness']:.8e}"
+    )
     plt.show()
 
 def visualize_result(
@@ -450,7 +443,6 @@ class ExpConfig:
     source_label: str
     target_label: str
 
-
 def make_target_line(nx: int, nz: int, kind: str, value: int, device: str) -> torch.Tensor:
     """Return vertex indices for a target line: diagonal, row, or column."""
     indices: list[int] = []
@@ -487,31 +479,30 @@ def run_comparison_table(
     learning_rate: float,
     t_factor: float,
     smoothness_weight: float,   
+    desired_distance: float,
     configs: list[ExpConfig],
     output_dir: Path,
 ) -> None:
     """Run one weight for all configs and save a CSV table."""
-    import csv
-
     rows: list[dict[str, float | str]] = []
-
     for cfg in configs:
         print(f"\n=== {cfg.name}: {cfg.source_label} → {cfg.target_label} ===")
         result = optimize_heightfield(
-            initial_heights,
-            fixed_xz,
-            faces,
-            cfg.source,
-            cfg.target,
-            adjacent_face_pairs,
-            nx=nx,
-            nz=nz,
-            iterations=iterations,
-            learning_rate=learning_rate,
-            t_factor=t_factor,
-            smoothness_weight=smoothness_weight,
-            print_every=None,
-        )
+        initial_heights,
+        fixed_xz,
+        faces,
+        cfg.source,
+        cfg.target,
+        adjacent_face_pairs,
+        nx=nx,
+        nz=nz,
+        iterations=iterations,
+        learning_rate=learning_rate,
+        t_factor=t_factor,
+        desired_distance=desired_distance,
+        smoothness_weight=smoothness_weight,
+        print_every=None,
+    )
         rows.append(
             {
                 "experiment": cfg.name,
@@ -537,7 +528,6 @@ def run_comparison_table(
         writer.writeheader()
         writer.writerows(rows)
     print(f"\nComparison table saved to: {csv_path.resolve()}")
-
 def run_compare_experiments(
     initial_heights: torch.Tensor,
     fixed_xz: torch.Tensor,
@@ -549,6 +539,7 @@ def run_compare_experiments(
     learning_rate: float,
     t_factor: float,
     output_dir: Path,
+    desired_distance: float,
     device: str,
 ) -> None:
     """Entry point for --compare: fixed weight, vary source/target geometry."""
@@ -578,6 +569,7 @@ def run_compare_experiments(
         learning_rate=learning_rate,
         t_factor=t_factor,
         smoothness_weight=fixed_weight,
+        desired_distance=desired_distance,
         configs=configs_a,
         output_dir=output_dir / "exp_A_fixed_source",
     )
@@ -606,10 +598,10 @@ def run_compare_experiments(
         learning_rate=learning_rate,
         t_factor=t_factor,
         smoothness_weight=fixed_weight,
+        desired_distance=desired_distance,
         configs=configs_b,
         output_dir=output_dir / "exp_B_fixed_target",
     )
-
 
 def main() -> None:
     # Imitating inflate.py
@@ -617,25 +609,21 @@ def main() -> None:
     nz = 20
     width = 1.0
     depth = 1.0
-    iterations = 1000
-    learning_rate = 1e-2
+    iterations = 300
+    learning_rate = 1e-3
     t_factor = 10.0
     smoothness_weight = 1e-4
     pareto_iterations = 200
     device = "cpu"
     dtype = torch.float64
+    desired_distance = 0.5
 
     verts, faces = make_heightfield(
         nx, nz, width=width, depth=depth, dtype=dtype, device=device
     )
     fixed_xz = verts[:, [0, 2]].clone()
 
-    # All-diagonals experiment:
-    # diagonals = make_diagonals(nx, nz, device)
-
-    # Relaxed single-diagonal experiment:
-    # target_k = (nx + nz - 2) // 2
-    target_k = 14
+    target_k = 13
     target_diagonal = torch.tensor(
         [
             i * nz + j
@@ -647,7 +635,6 @@ def main() -> None:
         device=device,
     )
 
-    # target contours i+j=k
     source = torch.tensor([0], dtype=torch.long, device=device)
 
     # source = torch.tensor(
@@ -678,11 +665,12 @@ def main() -> None:
             iterations=pareto_iterations,
             learning_rate=learning_rate,
             t_factor=t_factor,
+            desired_distance=desired_distance,
             output_dir=Path("results/heightfield_pareto"),
         )
         return
 
-    if "--compare" in sys.argv:  
+    if "--compare" in sys.argv:
         run_compare_experiments(
             initial_heights,
             fixed_xz,
@@ -690,9 +678,10 @@ def main() -> None:
             adjacent_pairs,
             nx=nx,
             nz=nz,
-            iterations=100,  
+            iterations=100,
             learning_rate=learning_rate,
             t_factor=t_factor,
+            desired_distance=desired_distance,
             output_dir=Path("results/heightfield_compare"),
             device=device,
         )
@@ -704,38 +693,27 @@ def main() -> None:
         faces,
         source,
         target_diagonal,
-        adjacent_pairs, 
+        adjacent_pairs,
         nx=nx,
         nz=nz,
         iterations=iterations,
         learning_rate=learning_rate,
         t_factor=t_factor,
+        desired_distance=desired_distance,
         smoothness_weight=smoothness_weight,
     )
 
     optimized_verts = result.vertices
     final_distance = result.distance
-    # All-diagonals diagnostics:
-    # diagonal_stds = torch.stack(
-    #     [final_distance[d].std(correction=0) for d in diagonals]
-    # )
-    # diagonal_ranges = torch.stack(
-    #     [final_distance[d].max() - final_distance[d].min() for d in diagonals]
-    # )
-    # print("All-diagonals diagnostics:")
-    # print(f"  diagonals={len(diagonals)}")
-    # print(f"  mean_std={diagonal_stds.mean().item():.8e}")
-    # print(f"  max_std={diagonal_stds.max().item():.8e}")
-    # print(f"  mean_range={diagonal_ranges.mean().item():.8e}")
-    # print(f"  max_range={diagonal_ranges.max().item():.8e}")
-
-    # Relaxed single-diagonal diagnostics:
     print("Target diagonal diagnostics:")
     print(f"  k={target_k}")
     print(f"  vertices={target_diagonal.numel()}")
+    print(f"  desired_distance={desired_distance:.8e}")
     print(f"  mean={result.distance_mean:.8e}")
     print(f"  min={result.distance_min:.8e}")
     print(f"  max={result.distance_max:.8e}")
+    print(f"  rmse={result.distance_rmse:.8e}")
+    print(f"  max_error={result.distance_max_error:.8e}")
     print(f"  std={result.distance_std:.8e}")
     print(f"  range={result.distance_range:.8e}")
     print(f"  smoothness={result.smoothness:.8e}")
