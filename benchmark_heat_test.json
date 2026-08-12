@@ -19,22 +19,108 @@
     ],
     "desired_distance": 0.5,
     "l2_tolerance": 0.01,
-    "max_iterations": 2,
-    "device": "cpu",
+    "max_iterations": 50,
+    "device": "cuda",
     "dtype": "torch.float64"
   },
   "methods": {
+    "iskra": {
+      "median_elapsed_seconds": 59.41295982897282,
+      "runs": [
+        {
+          "method": "iskra",
+          "converged": false,
+          "elapsed_seconds": 59.41295982897282,
+          "iterations": 50,
+          "final_l2": 0.13065265036496213,
+          "final_rmse": 0.039393256284188174,
+          "final_max_error": 0.06939130715152408
+        },
+        {
+          "method": "iskra",
+          "converged": false,
+          "elapsed_seconds": 59.73056066199206,
+          "iterations": 50,
+          "final_l2": 0.13065265036496304,
+          "final_rmse": 0.039393256284188445,
+          "final_max_error": 0.0693913071515273
+        },
+        {
+          "method": "iskra",
+          "converged": false,
+          "elapsed_seconds": 62.83350668800995,
+          "iterations": 50,
+          "final_l2": 0.1306526503649614,
+          "final_rmse": 0.03939325628418795,
+          "final_max_error": 0.0693913071515232
+        },
+        {
+          "method": "iskra",
+          "converged": false,
+          "elapsed_seconds": 55.06758945900947,
+          "iterations": 50,
+          "final_l2": 0.1306526503649624,
+          "final_rmse": 0.03939325628418826,
+          "final_max_error": 0.06939130715151998
+        },
+        {
+          "method": "iskra",
+          "converged": false,
+          "elapsed_seconds": 53.16533600911498,
+          "iterations": 50,
+          "final_l2": 0.1306526503649621,
+          "final_rmse": 0.03939325628418817,
+          "final_max_error": 0.06939130715152109
+        }
+      ]
+    },
     "heat_method": {
-      "median_elapsed_seconds": 0.14660225005354732,
+      "median_elapsed_seconds": 3.971906093880534,
       "runs": [
         {
           "method": "heat_method",
-          "converged": false,
-          "elapsed_seconds": 0.14660225005354732,
-          "iterations": 2,
-          "final_l2": 0.25067095787999083,
-          "final_rmse": 0.07558013755699199,
-          "final_max_error": 0.11546777376076789
+          "converged": true,
+          "elapsed_seconds": 3.971906093880534,
+          "iterations": 29,
+          "final_l2": 0.009481698827044114,
+          "final_rmse": 0.002858839762223475,
+          "final_max_error": 0.00574779349449106
+        },
+        {
+          "method": "heat_method",
+          "converged": true,
+          "elapsed_seconds": 4.01887135906145,
+          "iterations": 29,
+          "final_l2": 0.009481698827044114,
+          "final_rmse": 0.002858839762223475,
+          "final_max_error": 0.00574779349449106
+        },
+        {
+          "method": "heat_method",
+          "converged": true,
+          "elapsed_seconds": 4.010270355036482,
+          "iterations": 29,
+          "final_l2": 0.009481698827044114,
+          "final_rmse": 0.002858839762223475,
+          "final_max_error": 0.00574779349449106
+        },
+        {
+          "method": "heat_method",
+          "converged": true,
+          "elapsed_seconds": 3.68092432199046,
+          "iterations": 29,
+          "final_l2": 0.009481698827044114,
+          "final_rmse": 0.002858839762223475,
+          "final_max_error": 0.00574779349449106
+        },
+        {
+          "method": "heat_method",
+          "converged": true,
+          "elapsed_seconds": 3.617106911027804,
+          "iterations": 29,
+          "final_l2": 0.009481698827044114,
+          "final_rmse": 0.002858839762223475,
+          "final_max_error": 0.00574779349449106
         }
       ]
     }
