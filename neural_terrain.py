@@ -7,6 +7,8 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
+import time
+import csv
 
 import iskra.sparse_linalg as sparse_linalg
 from heightfield_optimization import (
@@ -15,6 +17,7 @@ from heightfield_optimization import (
     normal_smoothness_loss,
 )
 from iskra.geometry.geodesics import heat_method_distance
+from fourier_analysis import analyze_height_spectrum
 
 sparse_linalg._cholmod_available = False
 
@@ -38,55 +41,157 @@ def diagonal(n, k):
 
 class MLP(nn.Module):
     # maps (x,z) in [0,1]^2 to a height. This is the whole "neural" part.
-    def __init__(self, hidden=64, scale=0.3):
+    def __init__(self, hidden=64, scale=0.2, activation = "tanh"):
         super().__init__()
+        # self.net = nn.Sequential(
+        #     nn.Linear(2, hidden),
+        #     nn.Tanh(),
+        #     nn.Linear(hidden, hidden),
+        #     nn.Tanh(),
+        #     nn.Linear(hidden, 1),
+        # ).double()
+        # self.scale = scale
+        activation_classes = {
+            "tanh": nn.Tanh,
+            "relu": nn.ReLU,
+            "softplus": nn.Softplus,
+            "silu": nn.SiLU,
+        }
+        if activation not in activation_classes:
+            raise ValueError(f"Unknown activation: {activation}")
+
+        activation_class = activation_classes[activation]
         self.net = nn.Sequential(
             nn.Linear(2, hidden),
-            nn.Tanh(),
+            activation_class(),
             nn.Linear(hidden, hidden),
-            nn.Tanh(),
+            activation_class(),
             nn.Linear(hidden, 1),
         ).double()
         self.scale = scale
+        self.activation_name = activation
 
     def forward(self, xz):
-        return self.net(2.0 * xz - 1.0).squeeze(-1) * self.scale
+        raw = self.net(2.0 * xz - 1.0).squeeze(-1)
+        return torch.tanh(raw) * self.scale
 
 
 def heights_to_verts(xz, h):
     return torch.stack([xz[:, 0], h, xz[:, 1]], dim=1)
 
 
-def train(mlp, n, k, iters, lr=1e-2, weight=8e-3):
+def train(mlp, n, k, iters, lr=1e-2, weight=1e-04, target_tolerance=1e-3, desired_distance=0.5):
     # train the MLP on an n x n mesh so the i+j=k diagonal becomes one distance contour
     xz, F = make_grid(n)
     pairs = adjacent_face_pairs(F)
-    src = torch.tensor([0, n * n - 1])  # two opposite corners
+    src = torch.tensor([0])  # two opposite corners
     diag = diagonal(n, k)
     opt = torch.optim.Adam(mlp.parameters(), lr=lr)
-    for _ in range(iters):
+
+    converged = False   
+    start_time = time.perf_counter()
+
+    for iteration in range(iters + 1):
         opt.zero_grad()
         V = heights_to_verts(xz, mlp(xz))
         phi = heat_method_distance(V, F, src, t_factor=10.0)
         d = phi[diag]
-        loss = (d - d.mean()).square().mean() + weight * normal_smoothness_loss(
-            V, F, pairs
-        )
+        # l2_error = torch.linalg.vector_norm(error)
+
+        # if iteration % 25 == 0:
+        #     print(f"  {n}x{n}: {iteration} iters, l2_error={l2_error:.2e}", flush=True)
+
+        # if l2_error <= l2_tolerance:
+        #     converged = True
+        #     break
+
+        target_error = d - desired_distance
+        target_mse = target_error.square().mean()
+        target_rmse = target_mse.sqrt()
+
+        if iteration % 25 == 0:
+            print(
+                f"  {n}x{n}: "
+                f"iteration={iteration}, "
+                f"target_mse={target_mse.item():.6e}, "
+                f"target_rmse={target_rmse.item():.6e}",
+                flush=True,
+            )
+
+        if target_mse.item() <= target_tolerance:
+            converged = True
+            break
+
+        if iteration == iters: 
+            break
+        
+        loss_smoothness = normal_smoothness_loss(V, F, pairs)
+        loss = target_mse + weight * loss_smoothness
         loss.backward()
+
+        for name, param in mlp.named_parameters():
+            if param.grad is None:
+                raise RuntimeError(f"Missing gradient for {name} " f"at iteration {iteration}")
+
+            if not torch.isfinite(param.grad).all():
+                raise RuntimeError(f"Non-finite gradient for {name} " f"at iteration {iteration}")
         opt.step()
+
+    elapsed = time.perf_counter() - start_time
+
     with torch.no_grad():
         V = heights_to_verts(xz, mlp(xz))
-        std = heat_method_distance(V, F, src, 10.0)[diag].std(correction=0).item()
-    print(f"  {n}x{n}: {iters} iters, diagonal std={std:.2e}", flush=True)
-    return xz, F, src, diag
+        phi = heat_method_distance(V, F, src, t_factor=10.0)
+        d = phi[diag]
 
+        target_error = d - desired_distance
+        target_mse = target_error.square().mean().item()
+        target_rmse = target_error.square().mean().sqrt().item()
+        target_l2 = torch.linalg.vector_norm(target_error).item()
+        target_max_error = target_error.abs().max().item()
+
+        contour_std = d.std(correction=0).item()
+        mean_distance = d.mean().item()
+
+        final_smoothness = normal_smoothness_loss(V, F, pairs).item()
+        height_range = (V[:, 1].max() - V[:, 1].min()).item()
+
+    print(
+        f"  {n}x{n}: "
+        f"converged={converged}, "
+        f"iterations={iteration}, "
+        f"time={elapsed:.4f}s, "
+        f"target_mse={target_mse:.6e}, "
+        f"target_rmse={target_rmse:.6e}, "
+        f"target_l2={target_l2:.6e}, "
+        f"target_max_error={target_max_error:.6e}, "
+        f"contour_std={contour_std:.6e}, "
+        f"mean_distance={mean_distance:.6e}",
+        flush=True,
+    )
+
+    return {
+        "scale": mlp.scale,
+        "converged": converged,
+        "iterations": iteration,
+        "target_mse": target_mse,
+        "target_rmse": target_rmse,
+        "normal_smoothness": final_smoothness,
+        "height_range": height_range,
+        "runtime": elapsed,
+    }
 
 def sample(mlp, n, k):
     # evaluate the trained MLP at any resolution (no training) -> continuous surface
     xz, F = make_grid(n)
-    src = torch.tensor([0, n * n - 1])
+    src = torch.tensor([0])
     with torch.no_grad():
         V = heights_to_verts(xz, mlp(xz))
+        print(
+            f"height min={V[:, 1].min().item():.6f}, "
+            f"max={V[:, 1].max().item():.6f}, "
+            f"range={(V[:, 1].max() - V[:, 1].min()).item():.6f}"
+        )
         phi = heat_method_distance(V, F, src, 10.0)
     return xz, F, V, phi, src, diagonal(n, k)
 
@@ -123,21 +228,324 @@ def render(V, F, phi, src, diag, out):
     )
     ps.register_curve_network("diag", pts, e, radius=0.004).set_color((1, 0, 0))
     ps.look_at((1.9, 1.5, 1.9), (0.5, 0.0, 0.5))
-    ps.screenshot(out)
-    print(f"  wrote {out}", flush=True)
+    # ps.screenshot(out)
+    # print(f"  wrote {out}", flush=True)
+    ps.show()
 
+
+def run_scale_analysis():
+    scales = [
+        0.05,
+        0.10,
+        0.15,
+        0.20,
+        0.25,
+        0.30,
+        0.40,
+    ]
+    results = []
+
+    for scale in scales:
+        print(f"\nRunning scale={scale:.2f}", flush=True)
+        # Every experiment starts from the same random initialization.
+        torch.manual_seed(0)
+        mlp = MLP(scale=scale)
+        result = train(mlp, n=32, k=8, iters=400, lr=1e-2, weight=1e-4, target_tolerance=1e-3,
+                       desired_distance=0.5)
+        results.append(result)
+        print(
+            f"scale={result['scale']:.2f}, "
+            f"converged={result['converged']}, "
+            f"iterations={result['iterations']}, "
+            f"mse={result['target_mse']:.6e}, "
+            f"rmse={result['target_rmse']:.6e}, "
+            f"smoothness={result['normal_smoothness']:.6e}, "
+            f"height_range={result['height_range']:.6f}, "
+            f"time={result['runtime']:.2f}s",
+            flush=True,
+        )
+
+    # Save all results to a CSV file.
+    output_dir = Path("results/geodesics/scale_analysis")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = output_dir / "scale_analysis.csv"
+    with csv_path.open("w", newline="") as csv_file:
+        writer = csv.DictWriter(
+            csv_file,
+            fieldnames=[
+                "scale",
+                "converged",
+                "iterations",
+                "target_mse",
+                "target_rmse",
+                "normal_smoothness",
+                "height_range",
+                "runtime",
+            ],
+        )
+        writer.writeheader()
+        writer.writerows(results)
+
+    print("\nScale analysis complete:")
+    print(f"Results saved to: {csv_path.resolve()}")
+
+    return results
+
+def run_target_analysis():
+    # target_distances = [0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60]
+    k_values = [4, 6, 8, 10, 12, 14, 15]
+
+    scale = 0.2
+    results = []
+
+    for k in k_values:
+        print(f"\nRunning k={k}", flush=True)
+        torch.manual_seed(0)
+        mlp = MLP(scale=scale)
+        result = train(
+            mlp,
+            n=32,
+            k=k,
+            iters=400,
+            lr=1e-2,
+            weight=1e-4,
+            target_tolerance=1e-3,
+            desired_distance=0.45,
+        )
+        result["k"] = k
+        results.append(result)
+
+    output_dir = Path("results/geodesics/target_analysis")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = output_dir / "target_analysis.csv"
+
+    fieldnames = [
+        "k",
+        "scale",
+        "converged",
+        "iterations",
+        "target_mse",
+        "target_rmse",
+        "normal_smoothness",
+        "height_range",
+        "runtime",
+    ]
+
+    with csv_path.open("w", newline="") as csv_file:
+        writer = csv.DictWriter(
+            csv_file,
+            fieldnames=fieldnames,
+        )
+        writer.writeheader()
+        writer.writerows(results)
+
+    print("\nTarget analysis summary:")
+    for result in results:
+        print(
+            f"k={result['k']}, "
+            f"converged={result['converged']}, "
+            f"iterations={result['iterations']}, "
+            f"mse={result['target_mse']:.6e}, "
+            f"rmse={result['target_rmse']:.6e}, "
+            f"smoothness={result['normal_smoothness']:.6e}, "
+            f"{result['normal_smoothness']:.6e}, "
+            f"height_range="
+            f"{result['height_range']:.6f}, "
+            f"time={result['runtime']:.2f}s"
+        )
+    print(f"\nResults saved to: {csv_path.resolve()}")
+
+    return results
+
+
+    activations = ["tanh", "relu", "softplus", "silu"]
+    results = []
+
+    for activation in activations:
+        print(f"\nRunning activation={activation}", flush=True)
+        torch.manual_seed(0)
+        mlp = MLP(scale=0.2, activation=activation)
+        result = train(
+            mlp,
+            n=32,
+            k=8,
+            iters=400,
+            lr=1e-2,
+            weight=1e-4,
+            target_tolerance=1e-3,
+            desired_distance=0.5,
+        )
+        results.append(result)
+
+    output_dir = Path("results/geodesics/activation_analysis")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = output_dir / "activation_analysis.csv"
+
+    fieldnames = [
+        "activation",
+        "scale",
+        "converged",
+        "iterations",
+        "target_mse",
+        "target_rmse",
+        "normal_smoothness",
+        "height_range",
+        "runtime",
+    ]
+
+    with csv_path.open("w", newline="") as csv_file:
+        writer = csv.DictWriter(
+            csv_file,
+            fieldnames=fieldnames,
+        )
+        writer.writeheader()
+        writer.writerows(results)
+
+    print("\nActivation analysis summary:")
+    for result in results:
+        print(
+            f"activation={result['activation']}, "
+            f"converged={result['converged']}, "
+            f"iterations={result['iterations']}, "
+            f"mse={result['target_mse']:.6e}, "
+            f"rmse={result['target_rmse']:.6e}, "
+            f"smoothness={result['normal_smoothness']:.6e}, "
+            f"{result['normal_smoothness']:.6e}, "
+            f"height_range="
+            f"{result['height_range']:.6f}, "
+            f"time={result['runtime']:.2f}s"
+        )
+    print(f"\nResults saved to: {csv_path.resolve()}")
+
+    return results
+
+
+def run_activation_analysis():
+    activations = [
+        "tanh",
+        "relu",
+        "softplus",
+        "silu",
+    ]
+    results = []
+    for activation in activations:
+        print(f"\nRunning activation={activation}", flush=True)
+        torch.manual_seed(0)
+        mlp = MLP(scale=0.2, activation=activation)
+
+        result = train(
+            mlp,
+            n=32,
+            k=8,
+            iters=400,
+            lr=1e-2,
+            weight=1e-4,
+            target_tolerance=1e-3,
+            desired_distance=0.5,
+        )
+        result["activation"] = activation
+        results.append(result)
+
+    output_dir = Path("results/geodesics/activation_analysis")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = output_dir / "activation_analysis.csv"
+
+    fieldnames = [
+        "activation",
+        "scale",
+        "converged",
+        "iterations",
+        "target_mse",
+        "target_rmse",
+        "normal_smoothness",
+        "height_range",
+        "runtime",
+    ]
+
+    with csv_path.open("w", newline="") as csv_file:
+        writer = csv.DictWriter(
+            csv_file,
+            fieldnames=fieldnames,
+        )
+        writer.writeheader()
+        writer.writerows(results)
+
+    print("\nActivation analysis summary:")
+    for result in results:
+        print(
+            f"activation={result['activation']}, "
+            f"converged={result['converged']}, "
+            f"iterations={result['iterations']}, "
+            f"mse={result['target_mse']:.6e}, "
+            f"rmse={result['target_rmse']:.6e}, "
+            f"smoothness="
+            f"{result['normal_smoothness']:.6e}, "
+            f"height_range="
+            f"{result['height_range']:.6f}, "
+            f"time={result['runtime']:.2f}s"
+        )
+    print(f"\nResults saved to: {csv_path.resolve()}")
+
+    return results
 
 def main():
+    run_activation_analysis()
+    '''
     torch.manual_seed(0)
-    mlp = MLP()
-
+    mlp = MLP(scale=0.1)
     print("train the MLP on a cheap 32x32 mesh:")
-    train(mlp, 32, k=8, iters=400)
+    train(
+        mlp,
+        n=32,
+        k=8,
+        iters=800,
+        lr=5e-3,
+        weight=0.0,
+        target_tolerance=1e-3,
+        desired_distance=0.5,
+    )
+
+    # print("analyze the trained MLP with Fourier analysis:")
+    # analyze_height_spectrum(mlp, n=128, cutoff=0.25, out="results/geodesics/fourier_analysis.png", show=True)
 
     print("evaluate the SAME weights at 128x128 (no retraining):")
-    xz, F, V, phi, src, diag = sample(mlp, 128, k=32)
+    xz, F, V, phi, src, diag = sample(mlp, 128, k=33)
     render(V, F, phi, src, diag, "results/geodesics/neural_terrain.png")
 
+    # print("stage 2: continue training on 128x128 mesh")
+    # train(
+    #     mlp,
+    #     n=128,
+    #     k=33,
+    #     iters=300,
+    #     lr=2e-3,
+    #     weight=1e-3,
+    #     target_tolerance=1e-3,
+    #     desired_distance=0.3,
+    # )
+
+    # # Visualize the final fine-mesh result.
+    # xz, F, V, phi, src, diag = sample(
+    #     mlp,
+    #     n=128,
+    #     k=33,
+    # )
+    # render(
+    #     V,
+    #     F,
+    #     phi,
+    #     src,
+    #     diag,
+    #     "results/geodesics/neural_terrain_fine.png",
+    # )
+    '''
 
 if __name__ == "__main__":
     main()
+
+
+'''
+cd /Users/huyufan/iskra-heightfield-publish
+source .venv/bin/activate
+python neural_terrain.py
+'''
