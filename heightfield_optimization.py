@@ -827,17 +827,19 @@ def main() -> None:
     nz = 20
     width = 1.0
     depth = 1.0
-    iterations = 300
+    iterations = 200
     learning_rate = 1e-3
     t_factor = 10.0
-    smoothness_weight = 9e-3
-    # smoothness_weight = 3e-5
-    # smoothness_weight = 0.0
     pareto_iterations = 200
     device = "cpu"
     dtype = torch.float64
     desired_distance = 0.8
-    smoothness_type = "height"
+    # Normal
+    smoothness_type = "normal"
+    smoothness_weight = 3e-5
+    # # Height
+    # smoothness_type = "height"
+    # smoothness_weight = 9e-3
 
     verts, faces = make_heightfield(
         nx, nz, width=width, depth=depth, dtype=dtype, device=device
