@@ -208,7 +208,6 @@ def optimize_heightfield(
         # loss_smoothness = normal_smoothness_loss(vertices, faces, adjacent_face_pairs)
         loss_smoothness = height_smoothness_loss(heights, nx, nz)
         loss = loss_distance + smoothness_weight * loss_smoothness
-        # loss = loss_distance + smoothness_weight * loss_smoothness
         loss.backward()
 
         if heights.grad is None or not torch.isfinite(heights.grad).all():
@@ -258,10 +257,15 @@ def optimize_heightfield(
         ).item(),
         distance_rmse=target_error.square().mean().sqrt().item(),
         distance_max_error=target_error.abs().max().item(),
-        smoothness=normal_smoothness_loss(
-            optimized_vertices,
-            faces,
-            adjacent_face_pairs,
+        # smoothness=normal_smoothness_loss(
+        #     optimized_vertices,
+        #     faces,
+        #     adjacent_face_pairs,
+        # ).item(),
+        smoothness=height_smoothness_loss(
+            optimized_vertices[:, 1],
+            nx,
+            nz,
         ).item(),
     )
 
@@ -703,7 +707,6 @@ def run_compare_experiments(
     )
 
 def main() -> None:
-    # Imitating inflate.py
     nx = 20
     nz = 20
     width = 1.0
@@ -836,11 +839,11 @@ def main() -> None:
 
     if "--visualize" in sys.argv:
         # Original visualization on the optimized 3D heightfield:
-        # display_verts = optimized_verts
+        display_verts = optimized_verts
 
         # Debugging visualization: display the optimized distance field on the
         # original flat parameter domain so contour shape is easier to inspect.
-        display_verts = verts
+        # display_verts = verts
         visualize_result(
             display_verts,
             faces,
