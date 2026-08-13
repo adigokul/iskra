@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 import time
 import csv
+import sys
 
 import iskra.sparse_linalg as sparse_linalg
 from heightfield_optimization import (
@@ -308,7 +309,7 @@ def run_target_analysis():
             k=k,
             iters=400,
             lr=1e-2,
-            weight=1e-4,
+            weight=1e-3,
             target_tolerance=1e-3,
             desired_distance=0.45,
         )
@@ -480,63 +481,88 @@ def run_activation_analysis():
     return results, summary_results
 
 def main():
-    run_activation_analysis()
+    run_scale_analysis()
     '''
+    if "--preliminary" not in sys.argv:
+        print(
+            "Usage: python neural_terrain.py --preliminary"
+        )
+        return
+
+    # Fixed initialization for reproducibility.
     torch.manual_seed(0)
-    mlp = MLP(scale=0.1)
-    print("train the MLP on a cheap 32x32 mesh:")
-    train(
+
+    mlp = MLP(
+        hidden=64,
+        scale=0.2,
+        activation="tanh",
+    )
+
+    print("Training the plain MLP:")
+    result = train(
         mlp,
         n=32,
         k=8,
         iters=800,
         lr=5e-3,
         weight=0.0,
-        target_tolerance=1e-3,
+        target_tolerance=1e-6,
         desired_distance=0.5,
     )
 
-    # print("analyze the trained MLP with Fourier analysis:")
-    # analyze_height_spectrum(mlp, n=128, cutoff=0.25, out="results/geodesics/fourier_analysis.png", show=True)
+    print("\nTraining result:")
+    print(
+        f"  RMSE={result['target_rmse']:.6e}"
+    )
+    print(
+        f"  height_range={result['height_range']:.6e}"
+    )
 
-    print("evaluate the SAME weights at 128x128 (no retraining):")
-    xz, F, V, phi, src, diag = sample(mlp, 128, k=33)
-    render(V, F, phi, src, diag, "results/geodesics/neural_terrain.png")
+    # Sample the same trained MLP at a higher resolution.
+    print("\nSampling the trained MLP at 128 x 128:")
+    xz, faces, vertices, distance, source, target = sample(
+        mlp,
+        n=128,
+        k=33,
+    )
 
-    # print("stage 2: continue training on 128x128 mesh")
-    # train(
-    #     mlp,
-    #     n=128,
-    #     k=33,
-    #     iters=300,
-    #     lr=2e-3,
-    #     weight=1e-3,
-    #     target_tolerance=1e-3,
-    #     desired_distance=0.3,
-    # )
+    # Fourier analysis of the same trained surface.
+    print("\nRunning Fourier analysis:")
+    analyze_height_spectrum(
+        mlp,
+        n=128,
+        cutoff=0.25,
+        out=(
+            "results/geodesics/"
+            "fourier_analysis.png"
+        ),
+        show=True,
+    )
 
-    # # Visualize the final fine-mesh result.
-    # xz, F, V, phi, src, diag = sample(
-    #     mlp,
-    #     n=128,
-    #     k=33,
-    # )
-    # render(
-    #     V,
-    #     F,
-    #     phi,
-    #     src,
-    #     diag,
-    #     "results/geodesics/neural_terrain_fine.png",
-    # )
+    # Interactive Polyscope visualization.
+    print("\nOpening the preliminary MLP visualization:")
+    render(
+        vertices,
+        faces,
+        distance,
+        source,
+        target,
+        (
+            "results/geodesics/"
+            "neural_terrain.png"
+        ),
+    )
     '''
-
+    
 if __name__ == "__main__":
+    
     main()
 
-
+    
 '''
-cd /Users/huyufan/iskra-heightfield-publish
-source .venv/bin/activate
-python neural_terrain.py
+cd /Users/huyufan/Documents/GitHub/iskra
+
+/Users/huyufan/iskra-heightfield-publish/.venv/bin/python \
+/Users/huyufan/Documents/GitHub/iskra/neural_terrain.py \
+--preliminary
 '''
