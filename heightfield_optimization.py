@@ -8,6 +8,7 @@ from pathlib import Path
 import csv
 import sys
 
+from matplotlib import axis
 import torch
 import polyscope as ps
 import iskra.sparse as sp
@@ -25,18 +26,20 @@ sparse_linalg._cholmod_available = False
 
 @dataclass
 class OptimizationResult:
-    """Geometry and diagnostics returned by one optimization run."""
-
     vertices: torch.Tensor
     distance: torch.Tensor
+
     distance_mean: float
     distance_min: float
     distance_max: float
     distance_std: float
     distance_range: float
-    smoothness: float
     distance_rmse: float
     distance_max_error: float
+
+    height_smoothness: float
+    normal_smoothness: float
+    height_range: float
 
 
 def make_heightfield(
@@ -182,6 +185,7 @@ def optimize_heightfield(
     learning_rate: float,
     t_factor: float,
     desired_distance: float,
+    smoothness_type: str,
     smoothness_weight: float,
     print_every: int | None = 50,
 ) -> OptimizationResult:
@@ -205,8 +209,14 @@ def optimize_heightfield(
 
         target_phi = distance[target_diagonal]
         loss_distance = (target_phi - desired_distance).square().mean()
-        # loss_smoothness = normal_smoothness_loss(vertices, faces, adjacent_face_pairs)
-        loss_smoothness = height_smoothness_loss(heights, nx, nz)
+        if smoothness_type == "height":
+            loss_smoothness = height_smoothness_loss(heights, nx, nz)
+        elif smoothness_type == "normal":
+            loss_smoothness = normal_smoothness_loss(
+                vertices, faces, adjacent_face_pairs
+            )
+        else:
+            raise ValueError(f"Unknown smoothness_type: {smoothness_type}")
         loss = loss_distance + smoothness_weight * loss_smoothness
         loss.backward()
 
@@ -245,29 +255,43 @@ def optimize_heightfield(
     final_target_phi = final_distance[target_diagonal]
 
     target_error = final_target_phi - desired_distance
+    height_smoothness_value = height_smoothness_loss(
+        heights.detach(),
+        nx,
+        nz,
+    ).item()
+
+    normal_smoothness_value = normal_smoothness_loss(
+        optimized_vertices,
+        faces,
+        adjacent_face_pairs,
+    ).item()
+
+    height_range_value = (
+        heights.detach().max()
+        - heights.detach().min()
+    ).item()
+
     return OptimizationResult(
         vertices=optimized_vertices,
         distance=final_distance.detach(),
+
         distance_mean=final_target_phi.mean().item(),
         distance_min=final_target_phi.min().item(),
         distance_max=final_target_phi.max().item(),
         distance_std=final_target_phi.std(correction=0).item(),
         distance_range=(
-            final_target_phi.max() - final_target_phi.min()
+            final_target_phi.max()
+            - final_target_phi.min()
         ).item(),
         distance_rmse=target_error.square().mean().sqrt().item(),
         distance_max_error=target_error.abs().max().item(),
-        # smoothness=normal_smoothness_loss(
-        #     optimized_vertices,
-        #     faces,
-        #     adjacent_face_pairs,
-        # ).item(),
-        smoothness=height_smoothness_loss(
-            optimized_vertices[:, 1],
-            nx,
-            nz,
-        ).item(),
+
+        height_smoothness=height_smoothness_value,
+        normal_smoothness=normal_smoothness_value,
+        height_range=height_range_value,
     )
+    
 
 
 # ---------------------------------------------------------------------------
@@ -287,6 +311,7 @@ def run_pareto_analysis(
     learning_rate: float,
     t_factor: float,
     desired_distance: float,
+    smoothness_type: str,
     output_dir: Path,
 ) -> None:
     """Sweep smoothness weights and plot the distance-smoothness trade-off."""
@@ -294,8 +319,6 @@ def run_pareto_analysis(
 
     weights = [
         0.0,
-        1e-6,
-        3e-6,
         1e-5,
         3e-5,
         1e-4,
@@ -304,7 +327,7 @@ def run_pareto_analysis(
         3e-3,
         1e-2,
     ]
-    
+
     rows: list[dict[str, float]] = []
 
     adjacent_pairs = make_adjacent_face_pairs(faces)
@@ -323,6 +346,7 @@ def run_pareto_analysis(
         learning_rate=learning_rate,
         t_factor=t_factor,
         desired_distance=desired_distance,
+        smoothness_type=smoothness_type,
         smoothness_weight=weight,
         )
         row = {
@@ -331,13 +355,17 @@ def run_pareto_analysis(
             "distance_max_error": result.distance_max_error,
             "distance_std": result.distance_std,
             "distance_range": result.distance_range,
-            "smoothness": result.smoothness,
+            "height_smoothness": result.height_smoothness,
+            "normal_smoothness": result.normal_smoothness,
+            "height_range": result.height_range,
         }
         rows.append(row)
         print(
-            f"  std={row['distance_std']:.8e}, "
-            f"range={row['distance_range']:.8e}, "
-            f"smoothness={row['smoothness']:.8e}"
+            f"  rmse={row['distance_rmse']:.8e}, "
+            f"max_error={row['distance_max_error']:.8e}, "
+            f"height_smoothness={row['height_smoothness']:.8e}, "
+            f"normal_smoothness={row['normal_smoothness']:.8e}, "
+            f"height_range={row['height_range']:.8e}"
         )
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -347,41 +375,97 @@ def run_pareto_analysis(
         writer.writeheader()
         writer.writerows(rows)
 
-    smoothness_values = [row["smoothness"] for row in rows]
-    distance_errors = [row["distance_rmse"] for row in rows]
+    smoothness_key = f"{smoothness_type}_smoothness"
+    # Each point stores:
+    # (smoothness energy, distance RMSE, original row)
+    points = [
+        (
+            row[smoothness_key],
+            row["distance_rmse"],
+            row,
+        )
+        for row in rows
+    ]
+    # Both smoothness energy and RMSE are minimized.
+    points.sort(key=lambda point: point[0])
+    # Extract the non-dominated Pareto frontier.
+    frontier = []
+    best_rmse = float("inf")
+    for smoothness, rmse, row in points:
+        if rmse < best_rmse:
+            frontier.append(
+                (smoothness, rmse, row)
+            )
+            best_rmse = rmse
+
     figure, axis = plt.subplots(figsize=(7, 5))
+    # Plot every optimization run in gray.
     axis.scatter(
-        smoothness_values,
-        distance_errors,
-        s=60,
+        [point[0] for point in points],
+        [point[1] for point in points],
+        color="lightgray",
+        edgecolor="gray",
+        s=55,
+        label="All runs",
+        zorder=1,
     )
-    axis.set_xscale("log")
-    axis.set_yscale("log")
-    for row in rows:
+    # Plot and connect only the Pareto frontier.
+    frontier_x = [
+        point[0]
+        for point in frontier
+    ]
+    frontier_y = [
+        point[1]
+        for point in frontier
+    ]
+
+    axis.plot(
+        frontier_x,
+        frontier_y,
+        marker="o",
+        color="tab:blue",
+        linewidth=2,
+        markersize=7,
+        label="Pareto frontier",
+        zorder=2,
+    )
+
+    # Label each run with its regularization weight.
+    for smoothness, rmse, row in points:
         axis.annotate(
             f"lambda={row['weight']:.0e}",
-            (row["smoothness"], row["distance_rmse"]),
+            (smoothness, rmse),
             xytext=(5, 5),
             textcoords="offset points",
             fontsize=8,
         )
 
-    axis.set_xlabel("Height smoothness energy")
+    axis.set_xscale("log")
+    axis.set_yscale("log")
+
+    axis.set_xlabel(
+        f"{smoothness_type.capitalize()} smoothness energy"
+    )
     axis.set_ylabel("Target distance RMSE")
-    axis.set_title("Distance–smoothness Pareto analysis")
-    axis.grid(True, alpha=0.3)
+    axis.set_title(
+        "Distance–smoothness Pareto analysis"
+    )
+    axis.grid(
+        True,
+        which="both",
+        alpha=0.3,
+    )
+    axis.legend()
     figure.tight_layout()
 
     figure_path = output_dir / "pareto.png"
     figure.savefig(figure_path, dpi=200)
+
     print(f"Pareto data saved to: {csv_path.resolve()}")
     print(f"Pareto plot saved to: {figure_path.resolve()}")
-    print(
-        f"  rmse={row['distance_rmse']:.8e}, "
-        f"max_error={row['distance_max_error']:.8e}, "
-        f"std={row['distance_std']:.8e}, "
-        f"smoothness={row['smoothness']:.8e}"
-    )
+    print("x scale:", axis.get_xscale())
+    print("y scale:", axis.get_yscale())
+
     plt.show()
 
 def extract_isocontour(
@@ -448,12 +532,14 @@ def visualize_result(
     target_diagonal: torch.Tensor,
     target_k: int,
     desired_distance: float,
+    smoothness_type: str,
+    smoothness_weight: float,
 ) -> None:
     ps.init()
     ps.set_ground_plane_mode("shadow_only")
 
     ps_mesh = ps.register_surface_mesh(
-        "optimized heightfield",
+        f"optimized heightfield ({smoothness_type}, lambda={smoothness_weight:.1e})",
         display_vertices.detach().cpu().numpy(),
         faces.detach().cpu().numpy(),
     )
@@ -583,6 +669,7 @@ def run_comparison_table(
     t_factor: float,
     smoothness_weight: float,   
     desired_distance: float,
+    smoothness_type: str,
     configs: list[ExpConfig],
     output_dir: Path,
 ) -> None:
@@ -603,6 +690,7 @@ def run_comparison_table(
         learning_rate=learning_rate,
         t_factor=t_factor,
         desired_distance=desired_distance,
+        smoothness_type=smoothness_type,
         smoothness_weight=smoothness_weight,
         print_every=None,
     )
@@ -615,13 +703,16 @@ def run_comparison_table(
                 "distance_mean": result.distance_mean,
                 "distance_std": result.distance_std,
                 "distance_range": result.distance_range,
-                "smoothness": result.smoothness,
+                "height_smoothness": result.height_smoothness,
+                "normal_smoothness": result.normal_smoothness,
+                "height_range": result.height_range,
             }
         )
         print(
             f"  std={result.distance_std:.4e}, "
             f"range={result.distance_range:.4e}, "
-            f"smooth={result.smoothness:.4e}"
+            f"height_smooth={result.height_smoothness:.4e}, "
+            f"normal_smooth={result.normal_smoothness:.4e}"
         )
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -643,6 +734,7 @@ def run_compare_experiments(
     t_factor: float,
     output_dir: Path,
     desired_distance: float,
+    smoothness_type: str,
     device: str,
 ) -> None:
     """Entry point for --compare: fixed weight, vary source/target geometry."""
@@ -673,6 +765,7 @@ def run_compare_experiments(
         t_factor=t_factor,
         smoothness_weight=fixed_weight,
         desired_distance=desired_distance,
+        smoothness_type=smoothness_type,
         configs=configs_a,
         output_dir=output_dir / "exp_A_fixed_source",
     )
@@ -702,6 +795,7 @@ def run_compare_experiments(
         t_factor=t_factor,
         smoothness_weight=fixed_weight,
         desired_distance=desired_distance,
+        smoothness_type=smoothness_type,
         configs=configs_b,
         output_dir=output_dir / "exp_B_fixed_target",
     )
@@ -714,11 +808,13 @@ def main() -> None:
     iterations = 300
     learning_rate = 1e-3
     t_factor = 10.0
-    smoothness_weight = 1e-4
+    # smoothness_weight = 5e-3
+    smoothness_weight = 0.0
     pareto_iterations = 200
     device = "cpu"
     dtype = torch.float64
     desired_distance = 0.8
+    smoothness_type = "normal"
 
     verts, faces = make_heightfield(
         nx, nz, width=width, depth=depth, dtype=dtype, device=device
@@ -768,7 +864,8 @@ def main() -> None:
             learning_rate=learning_rate,
             t_factor=t_factor,
             desired_distance=desired_distance,
-            output_dir=Path("results/heightfield_pareto"),
+            smoothness_type=smoothness_type,
+            output_dir=Path(f"results/heightfield_pareto_{smoothness_type}"),
         )
         return
 
@@ -784,7 +881,8 @@ def main() -> None:
             learning_rate=learning_rate,
             t_factor=t_factor,
             desired_distance=desired_distance,
-            output_dir=Path("results/heightfield_compare"),
+            smoothness_type=smoothness_type,
+            output_dir=Path(f"results/heightfield_compare_{smoothness_type}"),
             device=device,
         )
         return
@@ -802,6 +900,7 @@ def main() -> None:
         learning_rate=learning_rate,
         t_factor=t_factor,
         desired_distance=desired_distance,
+        smoothness_type=smoothness_type,
         smoothness_weight=smoothness_weight,
     )
 
@@ -818,9 +917,11 @@ def main() -> None:
     print(f"  max_error={result.distance_max_error:.8e}")
     print(f"  std={result.distance_std:.8e}")
     print(f"  range={result.distance_range:.8e}")
-    print(f"  smoothness={result.smoothness:.8e}")
+    print(f"  height_smoothness={result.height_smoothness:.8e}")
+    print(f"  normal_smoothness={result.normal_smoothness:.8e}")
+    print(f"  height_range={result.height_range:.8e}")
 
-    output_dir = Path("results/heightfield_contours")
+    output_dir = Path(f"results/heightfield_contours_{smoothness_type}")
     output_dir.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
@@ -832,6 +933,12 @@ def main() -> None:
             "nz": nz,
             "target_k": target_k,
             "target_diagonal": target_diagonal,
+            "desired_distance": desired_distance,
+            "smoothness_type": smoothness_type,
+            "smoothness_weight": smoothness_weight,
+            "height_smoothness": result.height_smoothness,
+            "normal_smoothness": result.normal_smoothness,
+            "height_range": result.height_range,
         },
         output_dir / "optimized_heightfield.pt",
     )
@@ -839,11 +946,11 @@ def main() -> None:
 
     if "--visualize" in sys.argv:
         # Original visualization on the optimized 3D heightfield:
-        display_verts = optimized_verts
+        # display_verts = optimized_verts
 
         # Debugging visualization: display the optimized distance field on the
         # original flat parameter domain so contour shape is easier to inspect.
-        # display_verts = verts
+        display_verts = verts
         visualize_result(
             display_verts,
             faces,
@@ -852,6 +959,8 @@ def main() -> None:
             target_diagonal,
             target_k,
             desired_distance,
+            smoothness_type,
+            smoothness_weight,
         )
 
 if __name__ == "__main__":
@@ -861,10 +970,8 @@ if __name__ == "__main__":
 '''
 cd /Users/huyufan/iskra-heightfield-publish
 source .venv/bin/activate
-
 python -c "import torch; import iskra.sparse; print('environment OK')"
 '''
-
 
 '''
 /Users/huyufan/iskra-heightfield-publish/.venv/bin/python \
@@ -874,7 +981,7 @@ python -c "import torch; import iskra.sparse; print('environment OK')"
 
 '''
 /Users/huyufan/iskra-heightfield-publish/.venv/bin/python \
-  /Users/huyufan/iskra-heightfield-publish/heightfield_optimization.py \
+  /Users/huyufan/Documents/GitHub/iskra/heightfield_optimization.py \
   --pareto
 '''
 
