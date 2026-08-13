@@ -9,7 +9,7 @@ import csv
 import sys
 
 import torch
-
+import polyscope as ps
 import iskra.sparse as sp
 import iskra.sparse_linalg as sparse_linalg
 from iskra.sparse_linalg import linear_solve, min_quadratic_energy
@@ -98,12 +98,11 @@ def height_smoothness_loss(heights: torch.Tensor, nx: int, nz: int) -> torch.Ten
     y = heights.reshape(nx, nz)
 
     # Edges (i, j) -- (i + 1, j) in the x direction.
-    x_edge_loss = (y[1:, :] - y[:-1, :]).square().sum()
-
+    x_differences = (y[1:, :] - y[:-1, :]).square().reshape(-1)
     # Edges (i, j) -- (i, j + 1) in the z direction.
-    z_edge_loss = (y[:, 1:] - y[:, :-1]).square().sum()
+    z_differences = (y[:, 1:] - y[:, :-1]).square().reshape(-1)
 
-    return x_edge_loss + z_edge_loss
+    return torch.cat((x_differences, z_differences)).mean()
 
 
 def make_adjacent_face_pairs(faces: torch.Tensor) -> torch.Tensor:
@@ -206,10 +205,10 @@ def optimize_heightfield(
 
         target_phi = distance[target_diagonal]
         loss_distance = (target_phi - desired_distance).square().mean()
-        loss_smoothness = normal_smoothness_loss(vertices, faces, adjacent_face_pairs)
-        # loss_height = height_smoothness_loss(heights, nx, nz)
-        # loss = loss_distance + smoothness_weight * loss_height
+        # loss_smoothness = normal_smoothness_loss(vertices, faces, adjacent_face_pairs)
+        loss_smoothness = height_smoothness_loss(heights, nx, nz)
         loss = loss_distance + smoothness_weight * loss_smoothness
+        # loss = loss_distance + smoothness_weight * loss_smoothness
         loss.backward()
 
         if heights.grad is None or not torch.isfinite(heights.grad).all():
@@ -363,7 +362,7 @@ def run_pareto_analysis(
             fontsize=8,
         )
 
-    axis.set_xlabel("Normal smoothness energy")
+    axis.set_xlabel("Height smoothness energy")
     axis.set_ylabel("Target distance RMSE")
     axis.set_title("Distance–smoothness Pareto analysis")
     axis.grid(True, alpha=0.3)
@@ -381,6 +380,62 @@ def run_pareto_analysis(
     )
     plt.show()
 
+def extract_isocontour(
+    vertices: torch.Tensor,
+    faces: torch.Tensor,
+    values: torch.Tensor,
+    level: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Extract the piecewise-linear contour values == level."""
+
+    contour_points: list[torch.Tensor] = []
+    contour_edges: list[list[int]] = []
+
+    for face in faces:
+        triangle_vertices = vertices[face]
+        triangle_values = values[face]
+
+        intersections: list[torch.Tensor] = []
+
+        # Check the three edges of the triangle.
+        for a, b in ((0, 1), (1, 2), (2, 0)):
+            value_a = triangle_values[a]
+            value_b = triangle_values[b]
+
+            # The contour crosses the edge when the level lies
+            # strictly between the two endpoint values.
+            if (value_a - level) * (value_b - level) < 0:
+                t = (level - value_a) / (value_b - value_a)
+                point = (triangle_vertices[a]+ t* (triangle_vertices[b] - triangle_vertices[a]))
+                intersections.append(point)
+
+        # A regular contour crosses a triangle at two points.
+        if len(intersections) == 2:
+            start_index = len(contour_points)
+            contour_points.extend(intersections)
+            contour_edges.append(
+                [start_index, start_index + 1]
+            )
+
+    if not contour_points:
+        empty_points = vertices.new_empty((0, 3))
+        empty_edges = torch.empty(
+            (0, 2),
+            dtype=torch.long,
+            device=faces.device,
+        )
+        return empty_points, empty_edges
+
+    return (
+        torch.stack(contour_points),
+        torch.tensor(
+            contour_edges,
+            dtype=torch.long,
+            device=faces.device,
+        ),
+    )
+
+
 def visualize_result(
     display_vertices: torch.Tensor,
     faces: torch.Tensor,
@@ -388,18 +443,17 @@ def visualize_result(
     source: torch.Tensor,
     target_diagonal: torch.Tensor,
     target_k: int,
+    desired_distance: float,
 ) -> None:
-    """Display the optimized surface, distance contours, and target diagonal."""
-    import polyscope as ps
-
     ps.init()
     ps.set_ground_plane_mode("shadow_only")
+
     ps_mesh = ps.register_surface_mesh(
-        # "geodesic contours on flat domain",
         "optimized heightfield",
         display_vertices.detach().cpu().numpy(),
         faces.detach().cpu().numpy(),
     )
+
     ps_mesh.add_scalar_quantity(
         "heat-method distance",
         distance.detach().cpu().numpy(),
@@ -407,27 +461,72 @@ def visualize_result(
         isolines_enabled=True,
         enabled=True,
     )
+
+    
+    # Source vertices
     ps.register_point_cloud(
         "source",
         display_vertices[source].detach().cpu().numpy(),
         enabled=True,
-        radius=0.005,
+        radius=0.006,
+        color=(1.0, 0.55, 0.0),
+    )
+   
+    # Target set: solid magenta line
+    target_points = (
+        display_vertices[target_diagonal]
+        .detach()
+        .cpu()
+        .numpy()
     )
 
-    # Relaxed single-diagonal debugging visual:
-    target_points = display_vertices[target_diagonal].detach().cpu().numpy()
-    n_target = target_diagonal.numel()
+    number_of_target_points = target_diagonal.numel()
+
     target_edges = torch.stack(
-        (torch.arange(n_target - 1), torch.arange(1, n_target)), dim=1
+        (
+            torch.arange(number_of_target_points - 1),
+            torch.arange(1, number_of_target_points),
+        ),
+        dim=1,
     ).numpy()
-    ps.register_curve_network(
-        f"target diagonal k={target_k}",
+
+    ps.register_point_cloud(
+        f"target set: diagonal k={target_k}",
         target_points,
-        target_edges,
         color=(1.0, 0.0, 0.0),
-        radius=0.004,
+        radius=0.008,
         enabled=True,
     )
+
+    # Desired-distance contour
+    desired_points, desired_edges = extract_isocontour(
+        display_vertices,
+        faces,
+        distance,
+        desired_distance,
+    )
+
+    if desired_points.shape[0] > 0:
+        ps.register_curve_network(
+            (
+                "desired-distance contour: "
+                f"phi={desired_distance:.3f}"
+            ),
+            desired_points.detach().cpu().numpy(),
+            desired_edges.detach().cpu().numpy(),
+            color=(1.0, 0.85, 0.0),
+            radius=0.003,
+            enabled=True,
+        )
+
+    else:
+        print(
+            "Warning: no desired-distance contour was found.\n"
+            f"  desired_distance={desired_distance:.6f}\n"
+            f"  distance_min={distance.min().item():.6f}\n"
+            f"  distance_max={distance.max().item():.6f}"
+        )
+
     ps.show()
 
 
@@ -616,7 +715,7 @@ def main() -> None:
     pareto_iterations = 200
     device = "cpu"
     dtype = torch.float64
-    desired_distance = 0.5
+    desired_distance = 0.8
 
     verts, faces = make_heightfield(
         nx, nz, width=width, depth=depth, dtype=dtype, device=device
@@ -737,11 +836,11 @@ def main() -> None:
 
     if "--visualize" in sys.argv:
         # Original visualization on the optimized 3D heightfield:
-        display_verts = optimized_verts
+        # display_verts = optimized_verts
 
         # Debugging visualization: display the optimized distance field on the
         # original flat parameter domain so contour shape is easier to inspect.
-        # display_verts = verts
+        display_verts = verts
         visualize_result(
             display_verts,
             faces,
@@ -749,6 +848,7 @@ def main() -> None:
             source,
             target_diagonal,
             target_k,
+            desired_distance,
         )
 
 if __name__ == "__main__":
