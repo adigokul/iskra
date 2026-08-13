@@ -830,14 +830,14 @@ def main() -> None:
     iterations = 300
     learning_rate = 1e-3
     t_factor = 10.0
-    # smoothness_weight = 9e-3
-    smoothness_weight = 3e-5
+    smoothness_weight = 9e-3
+    # smoothness_weight = 3e-5
     # smoothness_weight = 0.0
     pareto_iterations = 200
     device = "cpu"
     dtype = torch.float64
     desired_distance = 0.8
-    smoothness_type = "normal"
+    smoothness_type = "height"
 
     verts, faces = make_heightfield(
         nx, nz, width=width, depth=depth, dtype=dtype, device=device
@@ -969,11 +969,11 @@ def main() -> None:
 
     if "--visualize" in sys.argv:
         # Original visualization on the optimized 3D heightfield:
-        # display_verts = optimized_verts
+        display_verts = optimized_verts
 
         # Debugging visualization: display the optimized distance field on the
         # original flat parameter domain so contour shape is easier to inspect.
-        display_verts = verts
+        # display_verts = verts
         visualize_result(
             display_verts,
             faces,
