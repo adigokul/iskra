@@ -317,14 +317,37 @@ def run_pareto_analysis(
     """Sweep smoothness weights and plot the distance-smoothness trade-off."""
     import matplotlib.pyplot as plt
 
+    # weights = [
+    #     0.0,
+    #     1e-5,
+    #     3e-5,
+    #     1e-4,
+    #     3e-4,
+    #     1e-3,
+    #     3e-3,
+    #     1e-2,
+    # ]
     weights = [
         0.0,
         1e-5,
         3e-5,
         1e-4,
         3e-4,
+        5e-4,
+        7e-4,
         1e-3,
+        1.5e-3,
+        2e-3,
+        2.5e-3,
         3e-3,
+        3.5e-3,
+        4e-3,
+        4.5e-3,
+        5e-3,
+        6e-3,
+        7e-3,
+        8e-3,
+        9e-3,
         1e-2,
     ]
 
@@ -552,7 +575,6 @@ def visualize_result(
         enabled=True,
     )
 
-    
     # Source vertices
     ps.register_point_cloud(
         "source",
@@ -808,8 +830,9 @@ def main() -> None:
     iterations = 300
     learning_rate = 1e-3
     t_factor = 10.0
-    # smoothness_weight = 5e-3
-    smoothness_weight = 0.0
+    # smoothness_weight = 9e-3
+    smoothness_weight = 3e-5
+    # smoothness_weight = 0.0
     pareto_iterations = 200
     device = "cpu"
     dtype = torch.float64
@@ -821,7 +844,7 @@ def main() -> None:
     )
     fixed_xz = verts[:, [0, 2]].clone()
 
-    target_k = 13
+    target_k = 8
     target_diagonal = torch.tensor(
         [
             i * nz + j
