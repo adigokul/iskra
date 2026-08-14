@@ -153,7 +153,7 @@ def normal_smoothness_loss(
         .mean()
     )
 
-def heat_method_distance(vertices, faces, source, t_factor=1.0):
+def heat_method_distance(vertices, faces, source, t_factor=10.0):
     # geodesic distance from the source(s) to every vertex.
     # t_factor scales the diffusion time (t = t_factor * mean_edge_len^2),
     # bunny needs ~10, clean grids ~1
@@ -879,7 +879,7 @@ def main() -> None:
     depth = 1.0
     iterations = 200
     learning_rate = 1e-3
-    t_factor = 1.0
+    t_factor = 10.0
     pareto_iterations = 500
     device = "cpu"
     dtype = torch.float64

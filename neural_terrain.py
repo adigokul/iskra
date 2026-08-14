@@ -85,7 +85,7 @@ def train(mlp, n, k, iters, lr=1e-2, weight=1e-04, target_tolerance=1e-3, desire
     # train the MLP on an n x n mesh so the i+j=k diagonal becomes one distance contour
     xz, F = make_grid(n)
     pairs = adjacent_face_pairs(F)
-    src = torch.tensor([0])  # two opposite corners
+    src = torch.tensor([0, n*n-1])  # two opposite corners
     diag = diagonal(n, k)
     opt = torch.optim.Adam(mlp.parameters(), lr=lr)
 
@@ -95,7 +95,7 @@ def train(mlp, n, k, iters, lr=1e-2, weight=1e-04, target_tolerance=1e-3, desire
     for iteration in range(iters + 1):
         opt.zero_grad()
         V = heights_to_verts(xz, mlp(xz))
-        phi = heat_method_distance(V, F, src, t_factor=10.0)
+        phi = heat_method_distance(V, F, src, t_factor=15.0)
         d = phi[diag]
         # l2_error = torch.linalg.vector_norm(error)
 
@@ -185,7 +185,7 @@ def train(mlp, n, k, iters, lr=1e-2, weight=1e-04, target_tolerance=1e-3, desire
 def sample(mlp, n, k):
     # evaluate the trained MLP at any resolution (no training) -> continuous surface
     xz, F = make_grid(n)
-    src = torch.tensor([0])
+    src = torch.tensor([0, n*n-1])  # two opposite corners
     with torch.no_grad():
         V = heights_to_verts(xz, mlp(xz))
         print(
@@ -480,9 +480,256 @@ def run_activation_analysis():
 
     return results, summary_results
 
+def run_mlp_pareto(
+    *,
+    output_dir: str = "results/geodesics/mlp_pareto",
+) -> list[dict[str, float]]:
+    """
+    Sweep normal-smoothness weights for the MLP heightfield.
+
+    Every run uses the same architecture, activation, scale, seed,
+    training grid, and optimization settings. Only the smoothness
+    weight changes.
+    """
+    import csv
+    from pathlib import Path
+
+    import matplotlib.pyplot as plt
+    import torch
+
+    output_path = Path(output_dir)
+    output_path.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    weights = [
+        0.0,
+        1e-4,
+        3e-4,
+        1e-3,
+        3e-3,
+        1e-2,
+        3e-2,
+        1e-1,
+        3e-1,
+        1.0,
+    ]
+
+    rows: list[dict[str, float]] = []
+
+    for weight in weights:
+        print(
+            "\nMLP Pareto run:"
+            f"\n  weight={weight:.8e}"
+        )
+
+        # Use exactly the same initialization for every weight.
+        torch.manual_seed(0)
+
+        mlp = MLP(
+            hidden=64,
+            scale=0.2,
+            activation="tanh",
+        )
+
+        result = train(
+            mlp,
+            n=32,
+            k=8,
+            iters=400,
+            lr=5e-3,
+            weight=weight,
+            target_tolerance=1e-6,
+            desired_distance=0.5,
+        )
+
+        row = {
+            "weight": float(weight),
+            "converged": float(result["converged"]),
+            "iterations": float(result["iterations"]),
+            "target_mse": float(result["target_mse"]),
+            "target_rmse": float(result["target_rmse"]),
+            "normal_smoothness": float(
+                result["normal_smoothness"]
+            ),
+            "height_range": float(
+                result["height_range"]
+            ),
+        }
+
+        rows.append(row)
+
+        print(
+            f"  converged={bool(row['converged'])}\n"
+            f"  iterations={int(row['iterations'])}\n"
+            f"  target_rmse={row['target_rmse']:.8e}\n"
+            f"  normal_smoothness="
+            f"{row['normal_smoothness']:.8e}\n"
+            f"  height_range={row['height_range']:.8e}"
+        )
+
+    # ---------------------------------------------------------
+    # Save all measurements.
+    # ---------------------------------------------------------
+    csv_path = output_path / "pareto_results.csv"
+
+    with csv_path.open(
+        "w",
+        newline="",
+    ) as csv_file:
+        writer = csv.DictWriter(
+            csv_file,
+            fieldnames=list(rows[0].keys()),
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+
+    # ---------------------------------------------------------
+    # Extract the non-dominated Pareto frontier.
+    # Both normal smoothness and RMSE are minimized.
+    # ---------------------------------------------------------
+    points = sorted(
+        rows,
+        key=lambda row: row["normal_smoothness"],
+    )
+
+    frontier: list[dict[str, float]] = []
+    best_rmse = float("inf")
+
+    for row in points:
+        rmse = row["target_rmse"]
+
+        if rmse < best_rmse:
+            frontier.append(row)
+            best_rmse = rmse
+
+    # ---------------------------------------------------------
+    # Plot all runs and the Pareto frontier.
+    # ---------------------------------------------------------
+    figure, axis = plt.subplots(
+        figsize=(8, 5.5)
+    )
+
+    converged_rows = [
+        row for row in rows
+        if bool(row["converged"])
+    ]
+
+    failed_rows = [
+        row for row in rows
+        if not bool(row["converged"])
+    ]
+
+    axis.scatter(
+        [
+            row["normal_smoothness"]
+            for row in converged_rows
+        ],
+        [
+            row["target_rmse"]
+            for row in converged_rows
+        ],
+        color="lightgray",
+        edgecolor="gray",
+        s=60,
+        label="Converged runs",
+        zorder=1,
+    )
+
+    if failed_rows:
+        axis.scatter(
+            [
+                row["normal_smoothness"]
+                for row in failed_rows
+            ],
+            [
+                row["target_rmse"]
+                for row in failed_rows
+            ],
+            color="tab:red",
+            marker="x",
+            s=70,
+            label="Not converged",
+            zorder=2,
+        )
+
+    axis.plot(
+        [
+            row["normal_smoothness"]
+            for row in frontier
+        ],
+        [
+            row["target_rmse"]
+            for row in frontier
+        ],
+        color="tab:blue",
+        marker="o",
+        linewidth=2,
+        markersize=7,
+        label="Pareto frontier",
+        zorder=3,
+    )
+
+    # Annotate each run with its smoothness weight.
+    for row in rows:
+        axis.annotate(
+            f"{row['weight']:.0e}",
+            (
+                row["normal_smoothness"],
+                row["target_rmse"],
+            ),
+            xytext=(5, 5),
+            textcoords="offset points",
+            fontsize=7,
+        )
+
+    axis.set_xscale("log")
+    axis.set_yscale("log")
+
+    axis.set_xlabel(
+        "Normal smoothness energy"
+    )
+    axis.set_ylabel(
+        "Target-distance RMSE"
+    )
+    axis.set_title(
+        "MLP heightfield: accuracy–smoothness trade-off"
+    )
+
+    axis.grid(
+        True,
+        which="both",
+        alpha=0.3,
+    )
+    axis.legend()
+
+    figure.tight_layout()
+
+    figure_path = output_path / "pareto.png"
+
+    figure.savefig(
+        figure_path,
+        dpi=200,
+        bbox_inches="tight",
+    )
+
+    print(f"\nPareto data saved to: {csv_path.resolve()}")
+    print(f"Pareto plot saved to: {figure_path.resolve()}")
+
+    plt.show()
+
+    return rows
+
 def main():
-    run_scale_analysis()
-    '''
+    # run_scale_analysis()
+    # run_activation_analysis()
+
+
+    if "--pareto" in sys.argv:
+        run_mlp_pareto()
+        return
+
     if "--preliminary" not in sys.argv:
         print(
             "Usage: python neural_terrain.py --preliminary"
@@ -498,7 +745,11 @@ def main():
         activation="tanh",
     )
 
+    # ---------------------------------------------------------
+    # Train the MLP on a 32 x 32 grid.
+    # ---------------------------------------------------------
     print("Training the plain MLP:")
+
     result = train(
         mlp,
         n=32,
@@ -511,23 +762,79 @@ def main():
     )
 
     print("\nTraining result:")
-    print(
-        f"  RMSE={result['target_rmse']:.6e}"
-    )
-    print(
-        f"  height_range={result['height_range']:.6e}"
+    print(f"  RMSE={result['target_rmse']:.6e}")
+    print(f"  height_range={result['height_range']:.6e}")
+
+    # ---------------------------------------------------------
+    # Sample and visualize at the training resolution.
+    # ---------------------------------------------------------
+    print("\nSampling at 32 x 32:")
+
+    (
+        xz_32,
+        faces_32,
+        vertices_32,
+        distance_32,
+        source_32,
+        target_32,
+    ) = sample(
+        mlp,
+        n=32,
+        k=8,
     )
 
-    # Sample the same trained MLP at a higher resolution.
+    print("\nOpening the 32 x 32 visualization:")
+
+    render(
+        vertices_32,
+        faces_32,
+        distance_32,
+        source_32,
+        target_32,
+        (
+            "results/geodesics/"
+            "neural_terrain_32.png"
+        ),
+    )
+
+    # ---------------------------------------------------------
+    # Sample the same trained MLP at a finer resolution.
+    # No additional training is performed.
+    # ---------------------------------------------------------
     print("\nSampling the trained MLP at 128 x 128:")
-    xz, faces, vertices, distance, source, target = sample(
+
+    (
+        xz_128,
+        faces_128,
+        vertices_128,
+        distance_128,
+        source_128,
+        target_128,
+    ) = sample(
         mlp,
         n=128,
         k=33,
     )
 
-    # Fourier analysis of the same trained surface.
+    print("\nOpening the 128 x 128 visualization:")
+
+    render(
+        vertices_128,
+        faces_128,
+        distance_128,
+        source_128,
+        target_128,
+        (
+            "results/geodesics/"
+            "neural_terrain_128.png"
+        ),
+    )
+
+    # ---------------------------------------------------------
+    # Fourier analysis of the same trained continuous surface.
+    # ---------------------------------------------------------
     print("\nRunning Fourier analysis:")
+
     analyze_height_spectrum(
         mlp,
         n=128,
@@ -539,23 +846,8 @@ def main():
         show=True,
     )
 
-    # Interactive Polyscope visualization.
-    print("\nOpening the preliminary MLP visualization:")
-    render(
-        vertices,
-        faces,
-        distance,
-        source,
-        target,
-        (
-            "results/geodesics/"
-            "neural_terrain.png"
-        ),
-    )
-    '''
-    
+
 if __name__ == "__main__":
-    
     main()
 
     
