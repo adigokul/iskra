@@ -323,84 +323,47 @@ def run_pareto_analysis(
     desired_distance: float,
     smoothness_type: str,
     output_dir: Path,
-    rmse_tolerance: float = 0.3,
-    selection_metric: str = "normal_smoothness",
-) -> dict[str, float]:
+) -> list[dict[str, float]]:
     """
-    Sweep regularization weights and analyze the trade-off between
-    target-distance accuracy and surface smoothness.
+    Sweep regularization weights and visualize the trade-off between
+    target-distance accuracy and the selected smoothness energy.
 
-    Parameters
-    ----------
-    rmse_tolerance:
-        Maximum allowed relative increase over the distance-only
-        baseline RMSE. For example, 0.25 allows a 25% increase.
-
-    selection_metric:
-        Geometric metric used to select the result inside the RMSE
-        budget. Use "normal_smoothness" to prioritize fewer local
-        bends, or "height_smoothness" to prioritize smaller height
-        differences.
-
-    Returns
-    -------
-    selected_row:
-        Metrics associated with the selected operating point.
+    The Pareto analysis does not automatically select a weight.
+    A suitable weight can be chosen from the resulting curve and
+    used later for visualization.
     """
     import csv
     import matplotlib.pyplot as plt
 
-    if smoothness_type == "height":
-        weights = [
-            0.0,
-            1e-3,
-            3e-3,
-            1e-2,
-            2e-2,
-            3e-2,
-            5e-2,
-            7e-2,
-            1e-1,
-            1.5e-1,
-            2e-1,
-            3e-1,
-        ]
-    elif smoothness_type == "normal":
-        weights = [
-            0.0,
-            2.5e-4,
-            5e-4,
-            7.5e-4,
-            1e-3,
-            1.5e-3,
-            2e-3,
-            3e-3,
-            5e-3,
-            7.5e-3,
-            1e-2,
-            2e-2,
-        ]
-    else:
+    if smoothness_type not in {"height", "normal"}:
         raise ValueError(
             f"Unknown smoothness_type: {smoothness_type!r}. "
             "Expected 'height' or 'normal'."
         )
 
-    valid_selection_metrics = {
-        "height_smoothness",
-        "normal_smoothness",
-    }
+    weights = [
+        0.0,
+        1e-5,
+        3e-5,
+        1e-4,
+        2e-4,
+        3e-4,
+        5e-4,
+        7e-4,
+        1e-3,
+        3e-3,
+        1e-2,
+        3e-2,
+        1e-1,
+        3e-1,
+        1.0,
+    ]
 
-    if selection_metric not in valid_selection_metrics:
-        raise ValueError(
-            f"Unknown selection_metric: {selection_metric!r}. "
-            f"Expected one of {sorted(valid_selection_metrics)}."
-        )
+    smoothness_key = f"{smoothness_type}_smoothness"
 
     print("\nPareto configuration:")
     print(f"  smoothness_type={smoothness_type}")
-    print(f"  selection_metric={selection_metric}")
-    print(f"  rmse_tolerance={100 * rmse_tolerance:.1f}%")
+    print(f"  smoothness_metric={smoothness_key}")
     print(f"  iterations={iterations}")
     print(f"  learning_rate={learning_rate:.8e}")
     print(f"  t_factor={t_factor:.8e}")
@@ -408,9 +371,8 @@ def run_pareto_analysis(
     print(f"  target_vertices={target_diagonal.numel()}")
     print(f"  source={source.tolist()}")
 
-    rows: list[dict[str, float]] = []
-
     adjacent_pairs = make_adjacent_face_pairs(faces)
+    rows: list[dict[str, float]] = []
 
     for weight in weights:
         print(
@@ -457,117 +419,15 @@ def run_pareto_analysis(
 
         print(
             f"  rmse={row['distance_rmse']:.8e}\n"
-            f"  max_error={row['distance_max_error']:.8e}\n"
+            f"  {smoothness_key}="
+            f"{row[smoothness_key]:.8e}\n"
             f"  height_smoothness="
             f"{row['height_smoothness']:.8e}\n"
             f"  normal_smoothness="
-            f"{row['normal_smoothness']:.8e}\n"
-            f"  height_range={row['height_range']:.8e}"
+            f"{row['normal_smoothness']:.8e}"
         )
 
-    # The zero-weight run is the distance-only baseline.
-    baseline_row = next(
-        row for row in rows
-        if row["weight"] == 0.0
-    )
-
-    baseline_rmse = baseline_row["distance_rmse"]
-    baseline_height = baseline_row["height_smoothness"]
-    baseline_normal = baseline_row["normal_smoothness"]
-
-    # Add baseline-relative measurements.
-    for row in rows:
-        row["rmse_ratio"] = (
-            row["distance_rmse"] / baseline_rmse
-        )
-
-        row["rmse_increase_percent"] = (
-            row["rmse_ratio"] - 1.0
-        ) * 100.0
-
-        row["height_reduction_percent"] = (
-            1.0
-            - row["height_smoothness"] / baseline_height
-        ) * 100.0
-
-        row["normal_reduction_percent"] = (
-            1.0
-            - row["normal_smoothness"] / baseline_normal
-        ) * 100.0
-
-    # Apply the common distance-accuracy budget.
-    rmse_limit = baseline_rmse * (
-        1.0 + rmse_tolerance
-    )
-
-    feasible_rows = [
-        row
-        for row in rows
-        if row["distance_rmse"] <= rmse_limit
-    ]
-
-    if not feasible_rows:
-        raise RuntimeError(
-            "No Pareto runs satisfy the RMSE budget."
-        )
-
-    # Select the smoothest feasible result using the same
-    # evaluation metric for both regularizers.
-    selected_row = min(
-        feasible_rows,
-        key=lambda row: row[selection_metric],
-    )
-
-    for row in rows:
-        row["selected"] = float(
-            row is selected_row
-        )
-
-    print("\nDistance-only baseline:")
-    print(f"  rmse={baseline_rmse:.8e}")
-    print(
-        f"  height_smoothness={baseline_height:.8e}"
-    )
-    print(
-        f"  normal_smoothness={baseline_normal:.8e}"
-    )
-
-    print("\nAccuracy budget:")
-    print(
-        f"  allowed RMSE increase="
-        f"{100 * rmse_tolerance:.1f}%"
-    )
-    print(f"  rmse_limit={rmse_limit:.8e}")
-
-    print("\nSelected operating point:")
-    print(f"  type={smoothness_type}")
-    print(
-        f"  selection_metric={selection_metric}"
-    )
-    print(
-        f"  weight={selected_row['weight']:.8e}"
-    )
-    print(
-        f"  rmse={selected_row['distance_rmse']:.8e}"
-    )
-    print(
-        f"  rmse_increase="
-        f"{selected_row['rmse_increase_percent']:.2f}%"
-    )
-    print(
-        f"  height_smoothness="
-        f"{selected_row['height_smoothness']:.8e}"
-    )
-    print(
-        f"  normal_smoothness="
-        f"{selected_row['normal_smoothness']:.8e}"
-    )
-    print(
-        f"  height_range="
-        f"{selected_row['height_range']:.8e}"
-    )
-
-    # Save all measurements.
+    # Save raw measurements.
     output_dir.mkdir(
         parents=True,
         exist_ok=True,
@@ -586,27 +446,7 @@ def run_pareto_analysis(
         writer.writeheader()
         writer.writerows(rows)
 
-    selected_csv_path = (
-        output_dir / "selected_result.csv"
-    )
-
-    with selected_csv_path.open(
-        "w",
-        newline="",
-    ) as csv_file:
-        writer = csv.DictWriter(
-            csv_file,
-            fieldnames=list(selected_row.keys()),
-        )
-        writer.writeheader()
-        writer.writerow(selected_row)
-
-    # Construct the Pareto plot using the optimized
-    # regularizer as the horizontal axis.
-    smoothness_key = (
-        f"{smoothness_type}_smoothness"
-    )
-
+    # Construct the Pareto plot using the regularizer being tested.
     points = [
         (
             row[smoothness_key],
@@ -616,12 +456,9 @@ def run_pareto_analysis(
         for row in rows
     ]
 
-    # Both smoothness energy and RMSE are minimized.
-    points.sort(
-        key=lambda point: point[0]
-    )
+    points.sort(key=lambda point: point[0])
 
-    # Extract the non-dominated Pareto frontier.
+    # Extract non-dominated points.
     frontier = []
     best_rmse = float("inf")
 
@@ -636,7 +473,6 @@ def run_pareto_analysis(
         figsize=(8, 5.5)
     )
 
-    # All optimization runs.
     axis.scatter(
         [point[0] for point in points],
         [point[1] for point in points],
@@ -647,17 +483,9 @@ def run_pareto_analysis(
         zorder=1,
     )
 
-    # Non-dominated frontier.
-    frontier_x = [
-        point[0] for point in frontier
-    ]
-    frontier_y = [
-        point[1] for point in frontier
-    ]
-
     axis.plot(
-        frontier_x,
-        frontier_y,
+        [point[0] for point in frontier],
+        [point[1] for point in frontier],
         marker="o",
         color="tab:blue",
         linewidth=2,
@@ -666,36 +494,6 @@ def run_pareto_analysis(
         zorder=2,
     )
 
-    # Distance-error budget.
-    axis.axhline(
-        rmse_limit,
-        color="tab:red",
-        linestyle="--",
-        linewidth=1.3,
-        label=(
-            f"RMSE budget "
-            f"(+{100 * rmse_tolerance:.0f}%)"
-        ),
-        zorder=1,
-    )
-
-    # Selected operating point.
-    selected_x = selected_row[smoothness_key]
-    selected_y = selected_row["distance_rmse"]
-
-    axis.scatter(
-        [selected_x],
-        [selected_y],
-        marker="*",
-        s=220,
-        color="red",
-        edgecolor="black",
-        linewidth=0.8,
-        label="Selected",
-        zorder=4,
-    )
-
-    # Label each run with its weight.
     for smoothness, rmse, row in points:
         axis.annotate(
             f"{row['weight']:.0e}",
@@ -712,9 +510,8 @@ def run_pareto_analysis(
         f"{smoothness_type.capitalize()} "
         "smoothness energy"
     )
-    axis.set_ylabel(
-        "Target distance RMSE"
-    )
+    axis.set_ylabel("Target distance RMSE")
+
     axis.set_title(
         f"{smoothness_type.capitalize()} "
         "regularization: accuracy–smoothness trade-off"
@@ -730,28 +527,19 @@ def run_pareto_analysis(
     figure.tight_layout()
 
     figure_path = output_dir / "pareto.png"
+
     figure.savefig(
         figure_path,
         dpi=200,
         bbox_inches="tight",
     )
 
-    print(
-        "\nPareto data saved to:",
-        csv_path.resolve(),
-    )
-    print(
-        "Selected result saved to:",
-        selected_csv_path.resolve(),
-    )
-    print(
-        "Pareto plot saved to:",
-        figure_path.resolve(),
-    )
+    print(f"\nPareto data saved to: {csv_path.resolve()}")
+    print(f"Pareto plot saved to: {figure_path.resolve()}")
 
     plt.show()
 
-    return selected_row
+    return rows
 
 def extract_isocontour(
     vertices: torch.Tensor,
@@ -1098,10 +886,11 @@ def main() -> None:
     desired_distance = 0.4
     # # Normal
     # smoothness_type = "normal"
-    # smoothness_weight = 3e-4
-    # Height
+    # smoothness_weight = 1e-2
+    # # Height
     smoothness_type = "height"
-    smoothness_weight = 3e-2
+    # smoothness_weight = 3e-3
+    smoothness_weight = 0.0
 
     verts, faces = make_heightfield(
         nx, nz, width=width, depth=depth, dtype=dtype, device=device
@@ -1153,8 +942,6 @@ def main() -> None:
             desired_distance=desired_distance,
             smoothness_type=smoothness_type,
             output_dir=Path(f"results/heightfield_pareto_{smoothness_type}"),
-            rmse_tolerance=0.25,
-            selection_metric="normal_smoothness",
         )
         return
 
@@ -1235,11 +1022,11 @@ def main() -> None:
 
     if "--visualize" in sys.argv:
         # Original visualization on the optimized 3D heightfield:
-        display_verts = optimized_verts
+        # display_verts = optimized_verts
 
         # Debugging visualization: display the optimized distance field on the
         # original flat parameter domain so contour shape is easier to inspect.
-        # display_verts = verts
+        display_verts = verts
         visualize_result(
             display_verts,
             faces,
